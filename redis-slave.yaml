@@ -1,0 +1,58 @@
+# 3. StatefulSet tạo 6 Pod (3 Master, 3 Replica) cho Redis Cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-slave
+spec:
+  serviceName: "redis-cluster-svc"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis-cluster
+      role: slave
+  template:
+    metadata:
+      labels:
+        app: redis-cluster
+        role: slave
+    spec:
+      containers:
+        - name: redis
+          image: 172.20.1.22/proxy-cache/redis:8.10
+          args: ["redis-server", "/conf/redis.conf"]
+          ports:
+            - containerPort: 6379
+              name: client
+            - containerPort: 16379
+              name: gossip
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+              readOnly: false
+            - name: data
+              mountPath: /data
+              readOnly: false
+      volumes:
+        - name: conf
+          configMap:
+            name: redis-cluster-config
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: local-storage
+        selector:
+          matchLabels:
+            node: hl19f-5gc-com117
+        resources:
+          requests:
+            storage: 10Gi

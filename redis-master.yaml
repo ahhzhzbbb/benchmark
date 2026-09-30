@@ -1,0 +1,92 @@
+# 1. ConfigMap để cấu hình Redis chạy ở chế độ Cluster
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-cluster-config
+data:
+  redis.conf: |
+    cluster-enabled yes
+    cluster-config-file nodes.conf
+    cluster-node-timeout 5000
+    cluster-announce-port 6379
+    cluster-announce-bus-port 16379
+    #   appendonly yes
+    dir /data
+---
+# 2. Headless Service để các Pod có thể giao tiếp nội bộ và phân giải DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-cluster-svc
+  labels:
+    app: redis-cluster
+spec:
+  clusterIP: None
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: client
+    - port: 16379
+      targetPort: 16379
+      name: gossip
+  selector:
+    app: redis-cluster
+---
+# 3. StatefulSet tạo 6 Pod (3 Master, 3 Replica) cho Redis Cluster
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-master
+spec:
+  serviceName: "redis-cluster-svc"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis-cluster
+      role: master
+  template:
+    metadata:
+      labels:
+        app: redis-cluster
+        role: master
+    spec:
+      containers:
+        - name: redis
+          image: 172.20.1.22/proxy-cache/redis:8.10
+          args: ["redis-server", "/conf/redis.conf"]
+          ports:
+            - containerPort: 6379
+              name: client
+            - containerPort: 16379
+              name: gossip
+          resources:
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+              readOnly: false
+            - name: data
+              mountPath: /data
+              readOnly: false
+      volumes:
+        - name: conf
+          configMap:
+            name: redis-cluster-config
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        storageClassName: local-storage
+        selector:
+          matchLabels:
+            node: hl19f-5gc-com116
+        resources:
+          requests:
+            storage: 10Gi
