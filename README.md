@@ -1,149 +1,139 @@
-# BenchmarkDB - Công cụ đo lường hiệu năng Database
+# BenchmarkDB - Công cụ đo lường hiệu năng Database (Open-Loop)
 
 ## 1. Giới thiệu
-`BenchmarkDB` là một công cụ mã nguồn mở nhỏ gọn được viết bằng ngôn ngữ Go, chuyên dụng để đo lường hiệu năng (benchmark) của các hệ thống database. Hiện tại hỗ trợ **Redis Cluster**, với khả năng mở rộng cho **Aerospike** (Phase 2).
+`BenchmarkDB` là một công cụ mã nguồn mở được viết bằng ngôn ngữ Go, chuyên dụng để đo lường hiệu năng (benchmark) của các hệ thống cơ sở dữ liệu. Điểm đặc biệt của công cụ này là sử dụng mô hình **open-loop benchmark**: tốc độ phát request được điều khiển bởi Rate Controller trung tâm, **độc lập với database latency**. Điều này đảm bảo kết quả benchmark phản ánh đúng khả năng chịu tải thực tế của database, không bị ảnh hưởng bởi closed-loop bias (tình trạng công cụ test tự động chạy chậm lại khi DB phản hồi chậm).
 
-Công cụ sử dụng mô hình **open-loop benchmark**: tốc độ phát request được điều khiển bởi Rate Controller trung tâm, **độc lập với database latency**. Điều này đảm bảo kết quả benchmark phản ánh đúng khả năng của database, không bị ảnh hưởng bởi closed-loop bias.
+Hiện tại, công cụ hỗ trợ:
+- **Redis Cluster** (Hỗ trợ RedisJSON và RediSearch cho truy vấn phức tạp).
+- **Aerospike** (Hỗ trợ Secondary Indexes cho truy vấn).
 
-## 2. Kiến trúc
+Mô hình dữ liệu giả lập được thiết kế tối ưu để mô phỏng dữ liệu mạng lõi viễn thông (5G SMF Session).
+
+## 2. Kiến trúc & Tối ưu hoá
 
 ```text
-                  Config (YAML)
-                     |
-                     v
-              Workload Generator
-                     |
-                     v
-              Rate Controller
-               Target TPS
-                     |
-                     v
-               Request Queue
-                     |
-           +---------+---------+
-           |         |         |
-           v         v         v
-        Worker 1  Worker 2  Worker N
-           |         |         |
-           +---------+---------+
-                     |
-                     v
-              Database Adapter
-               /           \
-              /             \
-       Redis Cluster      Aerospike (Phase 2)
-              \             /
-               \           /
-                     |
-                     v
-                  Response
-                     |
-                     v
-                  Metrics
-                     |
-                     v
-                   Report
+                  Config (YAML / CLI Args)
+                             |
+                             v
+                    Workload Generator 
+           (Pre-generated diverse payload pool)
+                             |
+                             v
+                      Rate Controller
+              (Absolute deadline timing, spin-wait)
+                        Target TPS
+                             |
+                             v
+                       Request Queue
+                   (Backpressure handling)
+                             |
+            +----------------+----------------+
+            |                |                |
+            v                v                v
+         Worker 1         Worker 2         Worker N
+            |                |                |
+            +----------------+----------------+
+                             |
+                             v
+                      Database Adapter
+                       /           \
+                      /             \
+               Redis Cluster      Aerospike
+                     \             /
+                      \           /
+                            |
+                            v
+                    Metrics Aggregator
+                            |
+                            v
+                      Console Report
 ```
 
-**Nguyên tắc kiến trúc quan trọng:**
-> Rate Controller quyết định tốc độ phát request. Worker chỉ thực thi request được dispatch. Worker KHÔNG có ticker riêng.
+**Các kỹ thuật tối ưu hoá (Optimizations) nổi bật:**
+1. **Zero-allocation trong vòng lặp chính**: Generator sinh sẵn chuỗi keys và đa dạng payload (pool) trước khi chạy benchmark, loại bỏ hoàn toàn `fmt.Sprintf` và `json.Marshal` ở đường dẫn thực thi (hot path).
+2. **Absolute Deadline Timer & Busy-wait**: Rate Controller dùng deadline tuyệt đối để ngăn trôi nhịp (drift) và dùng vòng lặp `runtime.Gosched()` (spin-wait) cho các khoảng nghỉ dưới 100µs nhằm đạt độ chính xác ở cấp độ micro-giây.
+3. **Lock-free worker**: Mỗi Worker có một bộ đếm metric cục bộ (`WorkerResult`), không chia sẻ trạng thái, không cần dùng Mutex, tối đa hoá throughput.
+4. **Cân bằng tải Redis Master**: Round-robin thông qua bộ đếm atomic lock-free cho các truy vấn RediSearch (`FT.SEARCH`) tránh nghẽn.
+5. **NOCONTENT RediSearch**: Giảm thiểu chi phí truyền dẫn I/O mạng khi thực hiện truy vấn.
 
 ## 3. Cấu trúc mã nguồn
 
 | File | Mô tả |
 |------|--------|
-| `main.go` | Điểm khởi chạy: đọc config, tạo DB adapter, chạy Runner |
-| `config.go` | Đọc cấu hình từ file YAML, định nghĩa tất cả config struct |
-| `config.yaml` | File cấu hình mẫu |
-| `database.go` | Interface `Database` trừu tượng + `Request`, `OperationType` |
-| `redis.go` | Redis Cluster adapter implement `Database` |
-| `workload.go` | Sinh request theo tỉ lệ cấu hình (GET/SET/DELETE/QUERY) hoặc nạp dữ liệu tuần tự |
-| `rate_controller.go` | Điều khiển tốc độ phát request (absolute deadline, tránh drift) |
-| `worker.go` | Worker pool nhận request từ queue và thực thi lên database |
-| `metrics.go` | Thu thập, tổng hợp, tính toán và in kết quả benchmark |
-| `runner.go` | Điều phối lifecycle và quản lý các mode chạy (Load / Benchmark) |
-| `Dockerfile` | Đóng gói Docker (multi-stage build) |
+| `main.go` | Điểm khởi chạy: parse config, tạo DB adapter, quản lý tín hiệu thoát và chạy Runner |
+| `config.go` | Xử lý cấu hình từ file YAML và CLI Flags |
+| `database.go` | Định nghĩa interface `Database` trừu tượng và các loại `OperationType` |
+| `redis.go` | Redis Cluster adapter (RedisJSON, RediSearch) |
+| `aerospike.go` | Aerospike adapter (Secondary Indexes, Filters) |
+| `workload.go` | Sinh request ngẫu nhiên theo tỉ lệ phân bổ (GET/SET/DELETE/QUERY) bằng pre-generated pool |
+| `rate_controller.go` | Scheduler chính điều khiển tốc độ (Open-loop) |
+| `worker.go` | Goroutine pool nhận job và giao tiếp với database, đo đạc latency |
+| `metrics.go` | Tổng hợp kết quả, tính toán các phân vị (Percentiles) và in báo cáo |
+| `runner.go` | Điều phối Lifecycle (Connect → Warmup → Measurement → Graceful Shutdown) |
 
 ## 4. Cách hoạt động chi tiết
 
-BenchmarkDB được thiết kế để chạy theo **2 Giai đoạn (Phases)** riêng biệt:
+BenchmarkDB chạy theo **2 Giai đoạn (Phases)** thiết kế rõ ràng:
 
 ### Giai đoạn 1: Nạp dữ liệu (Load Mode)
-Sử dụng cờ `--mode load`. Trong giai đoạn này, công cụ sẽ nạp toàn bộ số lượng bản ghi (được cấu hình trong `data.key_count`) tuần tự vào database. Nó sẽ chỉ thực hiện lệnh SET cho đến khi đẩy đủ toàn bộ dữ liệu rồi tự dừng.
+Lấp đầy cơ sở dữ liệu bằng các bản ghi giả lập trước khi đo đạc. Không áp dụng Rate Limit ở chế độ này, các worker sẽ "đẩy" (SET) dữ liệu nhanh nhất có thể cho tới khi đạt `data.key_count`.
 ```bash
 ./benchmarkDB --config config.yaml --mode load
 ```
 
 ### Giai đoạn 2: Đo lường thực tế (Run Mode)
-Sử dụng cờ `--mode run` (đây là mặc định). Giai đoạn này thực hiện test hiệu năng trên tập dữ liệu đã nạp ở Giai đoạn 1. Các lệnh (GET, SET, DELETE, QUERY) sẽ được sinh ngẫu nhiên theo tỉ lệ phần trăm bạn đã cấu hình trong mục `workload`.
-Quy trình (Lifecycle) trong giai đoạn Run:
-```text
-Connect → Warmup → Reset Metrics → Measurement → Shutdown → Report
-```
-1. **Connect**: Kiểm tra kết nối database (Ping).
-2. **Warmup**: Chạy làm ấm (warmup) connection pool dựa theo thời gian `warmup.duration`. Kết quả bị bỏ qua.
-3. **Measurement**: Chạy test chính thức dựa theo `benchmark.duration`. Thu thập đầy đủ metrics.
-4. **Shutdown**: Chờ cho in-flight requests hoàn thành trong `shutdown.grace_period`.
-5. **Report**: In kết quả ra stdout.
-
-### Tính năng cốt lõi khác:
-- **Open-loop Rate Control**: Dùng **absolute deadline**, ngăn tình trạng trôi nhịp (drift) khi DB phản hồi chậm.
-- **Backpressure**: Khi DB bị quá tải, Request Queue sẽ đầy. Số request bị vứt bỏ (dropped) sẽ được ghi nhận vào báo cáo.
-- **Reproducibility**: Có Random Seed, đảm bảo có thể chạy lại một kịch bản với thứ tự request chính xác như cũ.
+Giai đoạn này thực hiện tải với Rate Controller dựa trên tập dữ liệu đã nạp. Các lệnh (GET, SET, DELETE, QUERY_TAG, QUERY_NUMERIC) sinh ngẫu nhiên theo cấu hình `workload`.
+Quy trình (Lifecycle):
+1. **Connect & Init**: Ping database, thiết lập Index nếu cần (RediSearch/Aerospike SI).
+2. **Warmup**: Chạy làm nóng connection pool (không ghi nhận kết quả).
+3. **Measurement**: Chạy chính thức thu thập toàn bộ latency, errors, success.
+4. **Shutdown**: Grace period chờ các request đang in-flight (trong queue) xử lý xong.
+5. **Report**: Tổng hợp và in báo cáo.
 
 ## 5. Hướng dẫn Xây dựng (Build)
 
-### Build trực tiếp bằng Go
+**Sử dụng Go (Cần Go 1.21+):**
 ```bash
 go mod download
 go build -o benchmarkDB .
 ```
 
-### Build bằng Docker
+**Sử dụng Docker:**
 ```bash
 docker build -t benchmarkdb:latest .
 ```
 
 ## 6. Hướng dẫn Sử dụng (Usage)
 
-Khuyến nghị chạy theo đúng 2 phase để kết quả chính xác nhất:
-
-**Bước 1: Nạp dữ liệu vào Database:**
+**Bước 1: Nạp dữ liệu vào Database**
 ```bash
 ./benchmarkDB --config config.yaml --mode load
 ```
 
-**Bước 2: Chạy Benchmark:**
+**Bước 2: Chạy Benchmark**
 ```bash
-# Mặc định là mode run
+# Mặc định mode là "run"
 ./benchmarkDB --config config.yaml
-# Hoặc truyền --mode rõ ràng:
-./benchmarkDB --config config.yaml --mode run
-```
 
-*(Bạn có thể thay đổi số lượng Target TPS trực tiếp mà không cần sửa file config bằng cờ `--tps`)*
-```bash
-./benchmarkDB --config config.yaml --tps 2000
+# Bạn có thể ghi đè (override) cấu hình trực tiếp từ CLI flags:
+./benchmarkDB --config config.yaml --tps 50000 --concurrency 200 --get 40 --set 20 --delete 10 --query-tag 10 --query-numeric 5 --query-or 10 --query-prefix 5
 ```
 
 ## 7. Cấu hình (Configuration)
 
-Xem file `config.yaml` mẫu. Các section chính:
+File cấu hình mặc định là `config.yaml`. Một số mục quan trọng:
 
-| Section | Mô tả |
-|---------|--------|
-| `database.type` | Loại database: `redis` hoặc `aerospike` |
-| `redis.addresses` | Danh sách node Redis Cluster |
-| `data.key_count` | Số lượng key trong hệ thống (Giai đoạn Load sẽ chèn đủ chừng này key) |
-| `data.payload_size` | Kích thước value cho lệnh SET (bytes) |
-| `data.seed` | Random seed cho reproducibility |
-| `load.target_tps` | Số request/giây mục tiêu |
-| `load.max_concurrency` | Số lượng connection (worker) |
-| `load.queue_size` | Sức chứa tối đa của hàng đợi request |
-| `workload.get/set/delete/query` | Trọng số phần trăm cho từng loại thao tác ở mode `run` |
-| `warmup.duration` | Thời gian warmup (ví dụ: "5s") |
-| `benchmark.duration` | Thời gian benchmark chính thức (ví dụ: "10s") |
-| `shutdown.grace_period` | Thời gian chờ request hoàn tất khi kết thúc |
+| Section | Tham số | Ý nghĩa |
+|---------|----------|---------|
+| `database`| `type` | Chọn `redis` hoặc `aerospike` |
+| `redis` / `aerospike` | `addresses` / `hosts` | Danh sách node kết nối của DB |
+| `data` | `key_count` | Số lượng records tổng cộng để test |
+| `data` | `payload_size` | Dung lượng byte của mỗi bản ghi sinh ra |
+| `load` | `target_tps` | Số Request phát ra mỗi giây (mục tiêu) |
+| `load` | `max_concurrency` | Số lượng Worker / connection mở đồng thời |
+| `workload`| `get`, `set`... | Trọng số tỉ lệ % xuất hiện của loại request đó |
+| `warmup` | `duration` | Thời gian chạy rà trơn (VD: "5s", "1m") |
+| `benchmark` | `duration` | Thời gian ghi nhận số liệu (VD: "10s", "2m") |
 
 ## 8. Hiểu Kết quả Đầu ra (Output)
 
@@ -153,42 +143,36 @@ Xem file `config.yaml` mẫu. Các section chính:
 ============================================
 
 Database:         redis
-Duration:         10.003s
+Measurement:      10.003s
+Total Duration:   10.045s
 
-Target TPS:       1000
-Issued TPS:       999.70
-Completed TPS:    985.30
-Success TPS:      985.30
+Target TPS:       10000
+Issued TPS:       9998.50  <-- Tốc độ thực tế phát request
+Completed TPS:    9853.30
+Success TPS:      9853.30
 Error TPS:        0.00
 
-Total Issued:     9997
-Total Completed:  9853
-Success:          9853
+Total Issued:     99985
+Total Completed:  98533
+Success:          98533
 Errors:           0
-Error Rate:       0.00%
+Dropped (queue):  1400     <-- Số request bị vứt đi do hàng đợi đầy
+Abandoned:        52       <-- Request còn kẹt chưa xử lý xong sau Grace Period
 
 Latency:
-  Avg:            823µs
-  P50:            712µs
-  P95:            1.91ms
-  P99:            4.27ms
-  Max:            31.52ms
-
-============================================
+  Avg:            1.23ms
+  P50:            812µs
+  P95:            3.91ms
+  P99:            9.27ms
+  Max:            45.52ms
 ```
 
-| Metric | Ý nghĩa |
-|--------|---------|
-| **Target TPS** | Tốc độ mục tiêu (cấu hình) |
-| **Issued TPS** | Tốc độ thực tế công cụ phát request đi. Gần bằng Target = rate controller chạy tốt |
-| **Completed TPS** | Tốc độ nhận response thành công từ DB |
-| **Success/Error TPS** | Tốc độ request thành công / bị lỗi |
-| **Dropped** | Số request bị bỏ đi do hàng đợi đẩy lên DB bị đầy (Dấu hiệu DB quá tải) |
-| **P50/P95/P99** | Phân vị latency. Ví dụ: P99 là 4.27ms nghĩa là 99% request nhanh hơn 4.27ms |
-| **Max** | Request bị kẹt lâu nhất |
+- **Target TPS vs Issued TPS**: Nếu máy benchmark theo kịp, 2 con số này phải gần bằng nhau. 
+- **Latency (P50, P95, P99)**: Phản ánh thời gian thực tế để gọi DB (không tính thời gian nằm trong queue của công cụ test). P99 = 9.27ms nghĩa là 99% request có thời gian xử lý dưới mức này.
+- **Dropped**: Lượng request chủ động bị drop vì hàng đợi đã đầy. Đây là dấu hiệu cơ sở dữ liệu đã bị quá tải (saturated).
 
 ## 9. Roadmap
 
-- **Phase 1 (Hiện tại)**: Hỗ trợ GET / SET / DELETE / QUERY trên Redis Cluster. Cấu trúc Load vs Run Mode.
-- **Phase 2**: Tích hợp Aerospike adapter + Cải thiện Querying.
-- **Phase 3**: Xuất Prometheus metrics, HDR Histogram, Distributed benchmark (chạy trên nhiều máy đo đạc cùng lúc).
+- **Phase 1**: Hỗ trợ lệnh GET / SET / DELETE / QUERY trên Redis Cluster.
+- **Phase 2**: Hoàn thiện Aerospike adapter (Secondary Indexes/Filter expressions).
+- **Phase 3**: Đẩy dữ liệu ra Prometheus metrics, HDR Histogram, và hỗ trợ Distributed benchmark (clustering nhiều máy đẩy tải).

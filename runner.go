@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,8 +20,9 @@ import (
 //   - RateController (điều khiển tốc độ phát request - open-loop)
 //   - WorkerPool (thực thi request lên database)
 type Runner struct {
-	cfg Config
-	db  Database
+	cfg  Config
+	db   Database
+	keys *KeySpace // trạng thái key dùng chung giữa warmup và measurement
 }
 
 // NewRunner tạo Runner mới với cấu hình và database adapter đã cho.
@@ -62,12 +64,22 @@ func (r *Runner) Run(ctx context.Context) {
 		return
 	}
 
+	// KeySpace giả định toàn bộ key_count record đã được nạp bằng mode load.
+	r.keys = NewKeySpace(r.cfg.Data.KeyCount)
+
+	if r.cfg.Mode == "open-loop" {
+		fmt.Println("\nStarting open-loop continuous benchmark. Press Ctrl+C to stop...")
+		r.runOpenLoop(ctx)
+		return
+	}
+
 	// Bước 3: Warmup phase - chạy benchmark nhưng bỏ kết quả
 	// Mục đích: làm ấm connection pool, cache, v.v. để measurement
 	// phase phản ánh đúng hiệu năng steady-state.
+	// Warmup dùng seed khác measurement → chuỗi request khác nhau.
 	if r.cfg.Warmup.Duration.Duration > 0 {
 		fmt.Printf("\nStarting warmup (%v)...\n", r.cfg.Warmup.Duration.Duration)
-		r.runPhase(ctx, r.cfg.Warmup.Duration.Duration)
+		r.runPhase(ctx, r.cfg.Warmup.Duration.Duration, r.cfg.Data.Seed+warmupSeedOffset)
 		fmt.Println("Warmup completed. Resetting metrics.")
 	}
 
@@ -145,7 +157,7 @@ func (r *Runner) runLoad(ctx context.Context) {
 		}
 	}()
 
-	results := wp.Run(ctx, requests)
+	results := wp.Run(ctx, requests, false)
 	<-producerDone
 	<-progressDone
 
@@ -155,7 +167,7 @@ func (r *Runner) runLoad(ctx context.Context) {
 	// Tính tổng số lỗi trong load phase để báo cáo ngắn gọn
 	var errors int64
 	for _, res := range results {
-		for i := 0; i < 4; i++ {
+		for i := 0; i < len(res.Ops); i++ {
 			errors += res.Ops[i].Errors
 		}
 	}
@@ -175,13 +187,13 @@ func (r *Runner) runLoad(ctx context.Context) {
 //   - RateController phát request vào queue theo target TPS
 //   - WorkerPool nhận và thực thi request
 //   - Khi hết duration, tất cả dừng lại
-func (r *Runner) runPhase(ctx context.Context, duration time.Duration) {
+func (r *Runner) runPhase(ctx context.Context, duration time.Duration, streamSeed int64) {
 	phaseCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 
 	requests := make(chan Request, r.cfg.Load.QueueSize)
 
-	gen := NewWorkloadGenerator(r.cfg)
+	gen := NewWorkloadGenerator(r.cfg, streamSeed, r.keys)
 	rc := NewRateController(r.cfg.Load.TargetTPS)
 	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
 
@@ -194,7 +206,7 @@ func (r *Runner) runPhase(ctx context.Context, duration time.Duration) {
 	}()
 
 	// Chạy worker pool (blocking đến khi tất cả worker hoàn thành)
-	wp.Run(phaseCtx, requests)
+	wp.Run(phaseCtx, requests, false)
 	<-rcDone
 }
 
@@ -210,7 +222,7 @@ func (r *Runner) runPhase(ctx context.Context, duration time.Duration) {
 func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 	requests := make(chan Request, r.cfg.Load.QueueSize)
 
-	gen := NewWorkloadGenerator(r.cfg)
+	gen := NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed, r.keys)
 	rc := NewRateController(r.cfg.Load.TargetTPS)
 	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
 
@@ -238,7 +250,7 @@ func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 	}()
 
 	// Chạy worker pool (blocking đến khi tất cả worker hoàn thành hoặc ctx hết hạn)
-	results := wp.Run(workerCtx, requests)
+	results := wp.Run(workerCtx, requests, true)
 	<-rcDone // sync: đảm bảo genDuration đã được ghi trước khi đọc (happens-before)
 	workerDuration := time.Since(start) // thời gian thực tế workers chạy (bao gồm grace period)
 
@@ -250,13 +262,16 @@ func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 
 // printConfig in tóm tắt cấu hình benchmark ra stdout.
 func (r *Runner) printConfig() {
-	total := r.cfg.Workload.Get + r.cfg.Workload.Set + r.cfg.Workload.Delete + r.cfg.Workload.Query
-	getPct, setPct, delPct, qryPct := 0, 0, 0, 0
+	total := r.cfg.Workload.Get + r.cfg.Workload.Set + r.cfg.Workload.Delete + r.cfg.Workload.QueryTag + r.cfg.Workload.QueryNumeric + r.cfg.Workload.QueryOr + r.cfg.Workload.QueryPrefix
+	getPct, setPct, delPct, qtPct, qnPct, qoPct, qpPct := 0, 0, 0, 0, 0, 0, 0
 	if total > 0 {
 		getPct = r.cfg.Workload.Get * 100 / total
 		setPct = r.cfg.Workload.Set * 100 / total
 		delPct = r.cfg.Workload.Delete * 100 / total
-		qryPct = 100 - getPct - setPct - delPct
+		qtPct = r.cfg.Workload.QueryTag * 100 / total
+		qnPct = r.cfg.Workload.QueryNumeric * 100 / total
+		qoPct = r.cfg.Workload.QueryOr * 100 / total
+		qpPct = 100 - getPct - setPct - delPct - qtPct - qnPct - qoPct
 	}
 
 	fmt.Println()
@@ -269,8 +284,114 @@ func (r *Runner) printConfig() {
 	fmt.Printf("  Key Count:      %d\n", r.cfg.Data.KeyCount)
 	fmt.Printf("  Payload Size:   %d bytes\n", r.cfg.Data.PayloadSize)
 	fmt.Printf("  Seed:           %d\n", r.cfg.Data.Seed)
-	fmt.Printf("  Workload:       GET=%d%% SET=%d%% DELETE=%d%% QUERY=%d%%\n", getPct, setPct, delPct, qryPct)
+	fmt.Printf("  Workload:       GET=%d%% SET=%d%% DELETE=%d%% QUERY_TAG=%d%% QUERY_NUMERIC=%d%% QUERY_OR=%d%% QUERY_PREFIX=%d%%\n", getPct, setPct, delPct, qtPct, qnPct, qoPct, qpPct)
 	fmt.Printf("  Warmup:         %v\n", r.cfg.Warmup.Duration.Duration)
 	fmt.Printf("  Benchmark:      %v\n", r.cfg.Benchmark.Duration.Duration)
 	fmt.Printf("  Grace Period:   %v\n", r.cfg.Shutdown.GracePeriod.Duration)
+
+	if r.cfg.Mode == "load" {
+		return
+	}
+
+	// Cảnh báo: DELETE nhiều hơn SET → dataset sẽ teo dần trong lúc benchmark.
+	if r.cfg.Workload.Delete > r.cfg.Workload.Set {
+		fmt.Printf("  ⚠ WARNING: delete (%d) > set (%d): số record trong DB sẽ giảm dần trong lúc benchmark.\n"+
+			"    Đặt set >= delete để dataset ổn định (mỗi SET sẽ tái tạo một key đã bị xoá).\n",
+			r.cfg.Workload.Delete, r.cfg.Workload.Set)
+	}
+
+	// Cảnh báo: queue quá nhỏ so với TPS → chỉ một đợt chậm rất ngắn cũng gây drop.
+	// Ngưỡng: queue phải chứa được ít nhất ~10ms tải.
+	if minQueue := r.cfg.Load.TargetTPS / 100; r.cfg.Load.QueueSize < minQueue {
+		fmt.Printf("  ⚠ WARNING: queue_size (%d) chỉ chứa được < 10ms tải ở %d TPS, dễ bị drop. Nên >= %d.\n",
+			r.cfg.Load.QueueSize, r.cfg.Load.TargetTPS, minQueue)
+	}
+}
+
+// runOpenLoop chạy chế độ đo lường liên tục (infinite).
+// Phát request với TPS mục tiêu, báo cáo real-time sau mỗi giây.
+// Tự động dừng khi nhận ctx.Done() (thường là do Ctrl+C).
+func (r *Runner) runOpenLoop(ctx context.Context) {
+	requests := make(chan Request, r.cfg.Load.QueueSize)
+
+	gen := NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed, r.keys)
+	rc := NewRateController(r.cfg.Load.TargetTPS)
+	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
+
+	// Chạy rate controller trong goroutine riêng
+	rcDone := make(chan struct{})
+	go func() {
+		rc.Run(ctx, gen, requests)
+		close(requests)
+		close(rcDone)
+	}()
+
+	// Chạy worker pool ngầm không thu thập latency (trackLatency = false)
+	// Start trả về mảng con trỏ kết quả và một hàm Wait
+	results, wait := wp.Start(ctx, requests, false)
+
+	// Bắt đầu Reporter loop
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastTotalSlip int64
+	startTime := time.Now()
+
+	fmt.Println("\n--- Open-Loop Mode ---")
+	fmt.Printf("Target TPS: %d\n\n", r.cfg.Load.TargetTPS)
+
+reporterLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			break reporterLoop
+		case <-ticker.C:
+			var currentSuccess, currentNotFound, currentErrors int64
+			// Tổng hợp từ các worker
+			for _, res := range results {
+				for i := 0; i < 7; i++ {
+					currentSuccess += atomic.LoadInt64(&res.Ops[i].Success)
+					currentNotFound += atomic.LoadInt64(&res.Ops[i].NotFound)
+					currentErrors += atomic.LoadInt64(&res.Ops[i].Errors)
+				}
+			}
+			currentDropped := rc.Dropped()
+			currentIssued := rc.Issued()
+			currentTotalSlip := rc.TotalSlip()
+
+			sentTPS := currentIssued - lastIssued
+			successTPS := currentSuccess - lastSuccess
+			notFoundTPS := currentNotFound - lastNotFound
+			errorTPS := currentErrors - lastErrors
+
+			totalAckTPS := successTPS + notFoundTPS + errorTPS
+			errorRate := 0.0
+			if totalAckTPS > 0 {
+				errorRate = float64(errorTPS) / float64(totalAckTPS) * 100
+			}
+
+			// Tính Slip (Delay) trung bình trong 1 giây qua
+			slipDelta := currentTotalSlip - lastTotalSlip
+			avgSlipMs := 0.0
+			if sentTPS > 0 {
+				avgSlipMs = float64(slipDelta) / float64(sentTPS) / 1e6
+			}
+
+			elapsed := time.Since(startTime)
+			fmt.Printf("[%02d:%02d:%02d] Sent: %5d TPS | Ack: %5d TPS (Err: %4d, %5.2f%% | NotFound: %4d) | Dropped: %d | Slip: %5.2fms\n",
+				int(elapsed.Hours()), int(elapsed.Minutes())%60, int(elapsed.Seconds())%60,
+				sentTPS, totalAckTPS, errorTPS, errorRate, notFoundTPS, currentDropped, avgSlipMs)
+
+			lastSuccess = currentSuccess
+			lastNotFound = currentNotFound
+			lastErrors = currentErrors
+			lastIssued = currentIssued
+			lastTotalSlip = currentTotalSlip
+		}
+	}
+
+	fmt.Println("\nWaiting for in-flight requests to finish (grace period)...")
+	<-rcDone
+	wait()
+	fmt.Println("Open-loop benchmark stopped.")
 }

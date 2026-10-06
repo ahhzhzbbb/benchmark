@@ -36,6 +36,8 @@ type RateController struct {
 	interval  time.Duration // khoảng cách giữa hai request liên tiếp
 	targetTPS int
 	dropped   int64 // số request bị drop do queue đầy (atomic counter)
+	issued    int64 // số request đã đẩy thành công vào queue (atomic counter)
+	totalSlip int64 // tổng độ trễ lập lịch (nanoseconds) của các request đã issued
 }
 
 // NewRateController tạo rate controller cho target TPS đã cho.
@@ -60,14 +62,14 @@ func NewRateController(targetTPS int) *RateController {
 // Run chạy blocking trong goroutine riêng. Khi ctx bị cancel, Run thoát
 // và trả về tổng số request đã phát thành công (issued).
 func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<- Request) int64 {
-	var issued int64
-
 	// --- Pre-generate goroutine ---
 	// Sinh request trước vào buffer, chạy song song với vòng lặp dispatch.
 	// Chi phí gen.Next() (RNG, string formatting, v.v.) được chuyển sang goroutine này,
 	// giải phóng vòng lặp dispatch để chỉ tập trung vào timing và dispatch.
 	pregenBuf := make(chan Request, pregenBufferSize)
+	pregenDone := make(chan struct{})
 	go func() {
+		defer close(pregenDone)
 		defer close(pregenBuf)
 		for {
 			req, hasMore := gen.Next()
@@ -81,6 +83,11 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 			}
 		}
 	}()
+	// Chờ goroutine pre-generate thoát hẳn trước khi Run trả về: đảm bảo
+	// generator (và KeySpace dùng chung) không còn bị truy cập khi phase tiếp theo bắt đầu.
+	// Mọi nhánh return của Run đều xảy ra khi ctx đã Done hoặc pregenBuf đã đóng,
+	// nên goroutine chắc chắn thoát.
+	defer func() { <-pregenDone }()
 
 	start := time.Now()
 
@@ -91,11 +98,13 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 	timer.Stop()
 	defer timer.Stop()
 
+	var scheduled int64 // Số request ĐÃ LÊN LỊCH thành công hoặc thất bại
+
 	for {
 		// Tính deadline tuyệt đối: tránh drift tích luỹ
-		// Nếu request thứ N bị chậm (ví dụ: expected 100µs, actual 130µs),
-		// request N+1 vẫn được schedule tại thời điểm lý thuyết.
-		nextDeadline := start.Add(time.Duration(issued+1) * rc.interval)
+		// Dựa trên biến scheduled thay vì issued để luôn giữ đúng nhịp độ open-loop
+		// dù queue có bị đầy (dropped) hay không.
+		nextDeadline := start.Add(time.Duration(scheduled+1) * rc.interval)
 		waitDuration := time.Until(nextDeadline)
 
 		if waitDuration > spinThreshold {
@@ -104,7 +113,7 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return issued
+				return rc.Issued()
 			case <-timer.C:
 			}
 		} else if waitDuration > 0 {
@@ -117,14 +126,14 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 			// Kiểm tra ctx sau khi spin-wait
 			select {
 			case <-ctx.Done():
-				return issued
+				return rc.Issued()
 			default:
 			}
 		} else {
 			// Đã quá deadline (đang bị trễ), kiểm tra ctx trước khi tiếp tục
 			select {
 			case <-ctx.Done():
-				return issued
+				return rc.Issued()
 			default:
 			}
 		}
@@ -135,17 +144,26 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 		select {
 		case r, ok := <-pregenBuf:
 			if !ok {
-				return issued // generator đã hết (LoadGenerator exhausted)
+				return rc.Issued() // generator đã hết (LoadGenerator exhausted)
 			}
 			req = r
 		case <-ctx.Done():
-			return issued
+			return rc.Issued()
+		}
+
+		scheduled++
+
+		now := time.Now()
+		slip := now.Sub(nextDeadline)
+		if slip < 0 {
+			slip = 0
 		}
 
 		// Thử đẩy request vào queue
 		select {
 		case requests <- req:
-			issued++
+			atomic.AddInt64(&rc.issued, 1)
+			atomic.AddInt64(&rc.totalSlip, int64(slip))
 		default:
 			// Queue đầy → backpressure
 			// Ghi nhận dropped, không block rate controller
@@ -154,8 +172,16 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 	}
 }
 
-// Dropped trả về số request bị drop do queue đầy.
-// Giá trị này phản ánh mức độ saturation của benchmark generator.
 func (rc *RateController) Dropped() int64 {
 	return atomic.LoadInt64(&rc.dropped)
+}
+
+// Issued trả về số request thực sự đã gửi vào queue thành công.
+func (rc *RateController) Issued() int64 {
+	return atomic.LoadInt64(&rc.issued)
+}
+
+// TotalSlip trả về tổng thời gian slip (nanoseconds).
+func (rc *RateController) TotalSlip() int64 {
+	return atomic.LoadInt64(&rc.totalSlip)
 }

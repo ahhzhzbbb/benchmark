@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -106,7 +107,9 @@ func TestLoadGeneratorDiversity(t *testing.T) {
 			break
 		}
 		var rec Record
-		json.Unmarshal(req.Value, &rec)
+		if err := json.Unmarshal([]byte(req.Payload.JSON), &rec); err != nil {
+			t.Fatalf("invalid JSON payload: %v", err)
+		}
 		records = append(records, rec)
 		stateCount[rec.State]++
 	}
@@ -129,5 +132,157 @@ func TestLoadGeneratorDiversity(t *testing.T) {
 
 	for k, v := range stateCount {
 		t.Logf("%s: %d", k, v)
+	}
+}
+
+func runWorkloadCfg(get, set, del, qt, qn int) Config {
+	cfg := defaultConfig()
+	cfg.Data.KeyCount = 1000
+	cfg.Workload = WorkloadCfg{Get: get, Set: set, Delete: del, QueryTag: qt, QueryNumeric: qn}
+	return cfg
+}
+
+// TestSetKeepsSEIDMatchingKey: SET ở mode run phải ghi record có SEID khớp với key.
+func TestSetKeepsSEIDMatchingKey(t *testing.T) {
+	cfg := runWorkloadCfg(0, 100, 0, 0, 0)
+	gen := NewWorkloadGenerator(cfg, cfg.Data.Seed, NewKeySpace(cfg.Data.KeyCount))
+
+	for i := 0; i < 5000; i++ {
+		req, _ := gen.Next()
+		var rec Record
+		if err := json.Unmarshal([]byte(req.Payload.JSON), &rec); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		id := strings.TrimPrefix(req.Key, "bench:key:")
+		if rec.SEID != "SEID_"+id {
+			t.Fatalf("key %s has SEID %s", req.Key, rec.SEID)
+		}
+	}
+}
+
+// TestDeleteDoesNotShrinkDataset: với set >= delete, số key live gần như không đổi,
+// và GET không bao giờ nhắm vào key đã bị xoá.
+func TestDeleteDoesNotShrinkDataset(t *testing.T) {
+	cfg := runWorkloadCfg(40, 35, 25, 0, 0)
+	ks := NewKeySpace(cfg.Data.KeyCount)
+	gen := NewWorkloadGenerator(cfg, cfg.Data.Seed, ks)
+
+	deleted := make(map[string]bool)
+	minLive := ks.LiveCount()
+	for i := 0; i < 200000; i++ {
+		req, _ := gen.Next()
+		switch req.Operation {
+		case OpGet:
+			if deleted[req.Key] {
+				t.Fatalf("GET on deleted key %s", req.Key)
+			}
+		case OpDelete:
+			if deleted[req.Key] {
+				t.Fatalf("DELETE on already-deleted key %s", req.Key)
+			}
+			deleted[req.Key] = true
+		case OpSet:
+			delete(deleted, req.Key)
+		}
+		if ks.LiveCount() < minLive {
+			minLive = ks.LiveCount()
+		}
+		if ks.LiveCount()+len(deleted) != cfg.Data.KeyCount {
+			t.Fatalf("keyspace out of sync: live=%d deleted=%d", ks.LiveCount(), len(deleted))
+		}
+	}
+	// set > delete → key bị xoá được tái tạo ngay, dataset không teo dần.
+	if minLive < cfg.Data.KeyCount*95/100 {
+		t.Errorf("dataset shrank too much: min live = %d / %d", minLive, cfg.Data.KeyCount)
+	}
+	t.Logf("min live = %d / %d, final live = %d", minLive, cfg.Data.KeyCount, ks.LiveCount())
+}
+
+// TestKeySpaceInvariants kiểm tra pos/live/dead luôn nhất quán.
+func TestKeySpaceInvariants(t *testing.T) {
+	ks := NewKeySpace(100)
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 10000; i++ {
+		if rng.Intn(2) == 0 {
+			if id, ok := ks.randomLive(rng); ok {
+				ks.markDeleted(id)
+			}
+		} else {
+			ks.pickForSet(rng)
+		}
+		for idx, id := range ks.live {
+			if !ks.alive[id] || ks.pos[id] != int32(idx) {
+				t.Fatalf("live list corrupted at %d", idx)
+			}
+		}
+		for idx, id := range ks.dead {
+			if ks.alive[id] || ks.pos[id] != int32(idx) {
+				t.Fatalf("dead list corrupted at %d", idx)
+			}
+		}
+		if len(ks.live)+len(ks.dead) != ks.Len() {
+			t.Fatalf("size mismatch")
+		}
+	}
+}
+
+// TestWarmupStreamDiffersFromMeasurement: warmup và measurement không được
+// sinh cùng chuỗi request; cùng seed thì chuỗi phải giống hệt (reproducible).
+func TestWarmupStreamDiffersFromMeasurement(t *testing.T) {
+	cfg := runWorkloadCfg(50, 0, 0, 25, 25)
+	seq := func(seed int64) []string {
+		gen := NewWorkloadGenerator(cfg, seed, NewKeySpace(cfg.Data.KeyCount))
+		out := make([]string, 200)
+		for i := range out {
+			req, _ := gen.Next()
+			out[i] = req.Operation.String() + req.Key + req.QueryStr
+		}
+		return out
+	}
+	m1, m2 := seq(cfg.Data.Seed), seq(cfg.Data.Seed)
+	w := seq(cfg.Data.Seed + warmupSeedOffset)
+
+	same := 0
+	for i := range m1 {
+		if m1[i] != m2[i] {
+			t.Fatalf("same seed produced different request at %d", i)
+		}
+		if m1[i] == w[i] {
+			same++
+		}
+	}
+	if same > len(m1)/10 {
+		t.Errorf("warmup and measurement streams too similar: %d/%d identical", same, len(m1))
+	}
+}
+
+// TestAerospikePayloadIsPrebuilt: với Aerospike, payload phải là bins dựng sẵn.
+func TestAerospikePayloadIsPrebuilt(t *testing.T) {
+	cfg := runWorkloadCfg(0, 100, 0, 0, 0)
+	cfg.Database.Type = "aerospike"
+	gen := NewWorkloadGenerator(cfg, cfg.Data.Seed, NewKeySpace(cfg.Data.KeyCount))
+	req, _ := gen.Next()
+	if req.Payload == nil || req.Payload.Bins == nil {
+		t.Fatal("expected pre-built bins")
+	}
+	if len(req.Payload.Bins) != 13 {
+		t.Errorf("expected 13 bins, got %d", len(req.Payload.Bins))
+	}
+	id := strings.TrimPrefix(req.Key, "bench:key:")
+	if req.Payload.Bins["SEID"] != "SEID_"+id {
+		t.Errorf("SEID bin %v does not match key %s", req.Payload.Bins["SEID"], req.Key)
+	}
+}
+
+func TestParseAerospikeHost(t *testing.T) {
+	cases := map[string]int{"10.0.0.1": 3000, "db-0.svc:3100": 3100}
+	for in, port := range cases {
+		h, err := parseAerospikeHost(in)
+		if err != nil || h.Port != port {
+			t.Errorf("%s: got %v, %v", in, h, err)
+		}
+	}
+	if _, err := parseAerospikeHost("host:abc"); err == nil {
+		t.Error("expected error for bad port")
 	}
 }

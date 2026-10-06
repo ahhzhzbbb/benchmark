@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
-	"math/rand"
+	"errors"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // RedisDB là adapter implement Database interface cho Redis Cluster.
-// Sử dụng thư viện go-redis/v9 để giao tiếp với cụm Redis.
+//
+// Lưu ý về RediSearch trên Redis Cluster (OSS, không có coordinator):
+// mỗi master chỉ index phần dữ liệu thuộc các hash slot của nó. Vì vậy
+// FT.SEARCH phải được gửi tới TẤT CẢ master (scatter-gather) thì mới có
+// kết quả đầy đủ trên toàn bộ dataset.
 type RedisDB struct {
 	client  *redis.ClusterClient
 	masters []*redis.Client
@@ -24,6 +30,13 @@ func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
 	rdb := redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:    addrs,
 		PoolSize: poolSize,
+		// TỐI ƯU 1: Warm-up connection pool
+		// Nếu không có MinIdleConns, các request benchmark đầu tiên sẽ bị delay
+		// do phải liên tục thiết lập kết nối TCP (3-way handshake).
+		MinIdleConns: poolSize / 2,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
 	})
 	return &RedisDB{client: rdb}, nil
 }
@@ -32,19 +45,26 @@ func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
 func (r *RedisDB) Get(ctx context.Context, key string) error {
 	err := r.client.Do(ctx, "JSON.GET", key).Err()
 	if err == redis.Nil {
-		return nil
+		return ErrNotFound
 	}
 	return err
 }
 
-// Set ghi giá trị value vào key trong Redis dưới định dạng JSON.
-func (r *RedisDB) Set(ctx context.Context, key string, value []byte) error {
-	return r.client.Do(ctx, "JSON.SET", key, "$", string(value)).Err()
+// Set ghi JSON đã được serialize sẵn vào key.
+func (r *RedisDB) Set(ctx context.Context, key string, payload *Payload) error {
+	return r.client.Do(ctx, "JSON.SET", key, "$", payload.JSON).Err()
 }
 
-// Delete xoá key khỏi Redis.
+// Delete xoá key khỏi Redis. Trả về ErrNotFound nếu key không tồn tại.
 func (r *RedisDB) Delete(ctx context.Context, key string) error {
-	return r.client.Del(ctx, key).Err()
+	n, err := r.client.Del(ctx, key).Result()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // Close đóng kết nối tới Redis Cluster.
@@ -65,11 +85,12 @@ func (r *RedisDB) Name() string {
 // Init khởi tạo index RediSearch cho Redis.
 func (r *RedisDB) Init(ctx context.Context) error {
 	var mu sync.Mutex
-	r.masters = nil
+	// Reset danh sách masters mỗi lần init
+	r.masters = make([]*redis.Client, 0)
+
 	return r.client.ForEachMaster(ctx, func(ctx context.Context, client *redis.Client) error {
-		// Ping thử để lọc bỏ các IP "bóng ma" (stale nodes) do Topology của Redis Cluster bị lỗi
 		if err := client.Ping(ctx).Err(); err != nil {
-			return nil // Bỏ qua node này, không đưa vào danh sách r.masters
+			return nil // Bỏ qua node bị lỗi kết nối
 		}
 
 		mu.Lock()
@@ -91,18 +112,47 @@ func (r *RedisDB) Init(ctx context.Context) error {
 			"$.TEIDC", "AS", "TEIDC", "TAG").Err()
 
 		if err != nil && strings.Contains(err.Error(), "Index already exists") {
-			return nil // Bỏ qua nếu index đã tồn tại trên node này
+			return nil
 		}
 		return err
 	})
 }
 
-// Query thực thi truy vấn RediSearch.
-// Chọn một master node ngẫu nhiên để làm coordinator, giúp cân bằng tải.
-func (r *RedisDB) Query(ctx context.Context, query string) error {
-	if len(r.masters) > 0 {
-		target := r.masters[rand.Intn(len(r.masters))]
-		return target.Do(ctx, "FT.SEARCH", "idx", query, "LIMIT", 0, 10).Err()
+// searchArgs tạo tham số FT.SEARCH. NOCONTENT: chỉ trả về id, giảm I/O mạng.
+func searchArgs(query string) []interface{} {
+	return []interface{}{
+		"FT.SEARCH", "idx", query,
+		"TIMEOUT", strconv.Itoa(queryTimeoutMs),
+		"NOCONTENT",
+		"LIMIT", "0", strconv.Itoa(queryResultLimit),
 	}
-	return r.client.Do(ctx, "FT.SEARCH", "idx", query, "LIMIT", 0, 10).Err()
+}
+
+// Query thực thi truy vấn RediSearch theo mô hình scatter-gather:
+// gửi song song tới tất cả master và chờ tất cả trả lời.
+// Latency đo được = latency của shard chậm nhất, đúng với chi phí thực tế
+// mà client phải trả để có kết quả đầy đủ.
+func (r *RedisDB) Query(ctx context.Context, query string) error {
+	switch len(r.masters) {
+	case 0:
+		// Chưa lấy được danh sách master (Init lỗi) — fallback, kết quả có thể không đầy đủ.
+		return r.client.Do(ctx, searchArgs(query)...).Err()
+	case 1:
+		return r.masters[0].Do(ctx, searchArgs(query)...).Err()
+	}
+
+	errs := make([]error, len(r.masters))
+	var wg sync.WaitGroup
+	// Gửi tới master[1..n-1] trong goroutine, master[0] chạy ngay trên goroutine hiện tại.
+	for i := 1; i < len(r.masters); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = r.masters[i].Do(ctx, searchArgs(query)...).Err()
+		}(i)
+	}
+	errs[0] = r.masters[0].Do(ctx, searchArgs(query)...).Err()
+	wg.Wait()
+
+	return errors.Join(errs...)
 }

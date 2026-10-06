@@ -14,12 +14,13 @@ type BenchmarkResult struct {
 	TargetTPS      int             // TPS mục tiêu (cấu hình)
 	Issued         int64           // Số request đã phát bởi RateController
 	Dropped        int64           // Số request bị drop do queue đầy
-	Completed      int64           // Tổng request đã hoàn thành (success + error)
+	Completed      int64           // Tổng request đã hoàn thành (success + not found + error)
 	Success        int64           // Số request thành công
+	NotFound       int64           // Số GET/DELETE nhắm vào key không tồn tại
 	Errors         int64           // Số request lỗi
 	Abandoned      int64           // Số request còn trong queue khi benchmark kết thúc (Issued - Completed)
 	Latencies      []time.Duration // Danh sách latency của request thành công
-	Ops            [4]OpMetrics    // Chi tiết metrics theo từng loại operation (GET, SET, DELETE, QUERY)
+	Ops            [7]OpMetrics    // Chi tiết metrics theo từng loại operation (GET, SET, DELETE, QUERY_TAG, QUERY_NUMERIC, QUERY_OR, QUERY_PREFIX)
 }
 
 // MergeWorkerResults gộp kết quả từ tất cả worker thành một BenchmarkResult.
@@ -37,28 +38,30 @@ func MergeWorkerResults(results []*WorkerResult, genDuration, workerDuration tim
 
 	// Ước lượng tổng capacity để pre-allocate
 	totalCap := 0
-	opCap := [4]int{0, 0, 0, 0}
+	opCap := [7]int{0, 0, 0, 0, 0, 0, 0}
 	for _, r := range results {
-		for i := 0; i < 4; i++ {
+		for i := 0; i < 7; i++ {
 			l := len(r.Ops[i].Latencies)
 			totalCap += l
 			opCap[i] += l
 		}
 	}
 	br.Latencies = make([]time.Duration, 0, totalCap)
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 7; i++ {
 		br.Ops[i].Latencies = make([]time.Duration, 0, opCap[i])
 	}
 
 	for _, r := range results {
-		for i := 0; i < 4; i++ {
+		for i := 0; i < 7; i++ {
 			br.Ops[i].Completed += r.Ops[i].Completed
 			br.Ops[i].Success += r.Ops[i].Success
+			br.Ops[i].NotFound += r.Ops[i].NotFound
 			br.Ops[i].Errors += r.Ops[i].Errors
 			br.Ops[i].Latencies = append(br.Ops[i].Latencies, r.Ops[i].Latencies...)
 
 			br.Completed += r.Ops[i].Completed
 			br.Success += r.Ops[i].Success
+			br.NotFound += r.Ops[i].NotFound
 			br.Errors += r.Ops[i].Errors
 			br.Latencies = append(br.Latencies, r.Ops[i].Latencies...)
 		}
@@ -120,6 +123,9 @@ func PrintResults(cfg Config, result *BenchmarkResult) {
 	fmt.Printf("Total Issued:     %d\n", result.Issued)
 	fmt.Printf("Total Completed:  %d\n", result.Completed)
 	fmt.Printf("Success:          %d\n", result.Success)
+	if result.NotFound > 0 {
+		fmt.Printf("Not Found:        %d   (GET/DELETE vào key không tồn tại)\n", result.NotFound)
+	}
 	fmt.Printf("Errors:           %d\n", result.Errors)
 	if result.Dropped > 0 {
 		fmt.Printf("Dropped (queue):  %d\n", result.Dropped)
@@ -160,9 +166,9 @@ func PrintResults(cfg Config, result *BenchmarkResult) {
 	fmt.Printf("  Max:            %v\n", result.Latencies[n-1])
 	fmt.Println()
 
-	opNames := []string{"GET", "SET", "DELETE", "QUERY"}
+	opNames := []string{"GET", "SET", "DELETE", "QUERY_TAG", "QUERY_NUMERIC", "QUERY_OR", "QUERY_PREFIX"}
 	fmt.Println("Per-Operation Latency:")
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 7; i++ {
 		if len(result.Ops[i].Latencies) == 0 {
 			continue
 		}
@@ -179,6 +185,9 @@ func PrintResults(cfg Config, result *BenchmarkResult) {
 		avgOp := tot / time.Duration(nOp)
 
 		fmt.Printf("  %s (%d requests):\n", opNames[i], nOp)
+		if nf := result.Ops[i].NotFound; nf > 0 {
+			fmt.Printf("    Not Found: %d (không tính vào latency)\n", nf)
+		}
 		fmt.Printf("    Avg: %v, P50: %v, P95: %v, P99: %v, Max: %v\n",
 			avgOp,
 			percentile(result.Ops[i].Latencies, 50),

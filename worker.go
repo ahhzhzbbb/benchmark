@@ -2,23 +2,38 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+var errLogger *log.Logger
+
+func init() {
+	f, err := os.OpenFile("benchmark_errors.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err == nil {
+		errLogger = log.New(f, "", log.LstdFlags)
+	} else {
+		errLogger = log.New(os.Stderr, "", log.LstdFlags)
+	}
+}
+
 // OpMetrics lưu trữ metrics cho một loại operation cụ thể
 type OpMetrics struct {
-	Completed int64
+	Completed int64 // = Success + NotFound + Errors
 	Success   int64
+	NotFound  int64 // GET/DELETE nhắm vào key không tồn tại (không phải lỗi, không tính là success)
 	Errors    int64
-	Latencies []time.Duration
+	Latencies []time.Duration // chỉ gồm latency của request Success
 }
 
 // WorkerResult chứa kết quả thu thập từ một worker trong suốt quá trình benchmark.
 // Mỗi worker có WorkerResult riêng, không chia sẻ → không cần lock/mutex.
 type WorkerResult struct {
-	Ops [4]OpMetrics // 0: GET, 1: SET, 2: DELETE, 3: QUERY
+	Ops [7]OpMetrics // 0: GET, 1: SET, 2: DELETE, 3: QUERY_TAG, 4: QUERY_NUMERIC, 5: QUERY_OR, 6: QUERY_PREFIX
 }
 
 // WorkerPool quản lý một nhóm worker goroutine.
@@ -43,26 +58,39 @@ func NewWorkerPool(db Database, concurrency int) *WorkerPool {
 //
 // Run trả về danh sách WorkerResult từ tất cả worker sau khi channel
 // requests bị đóng hoặc ctx bị cancel.
-func (wp *WorkerPool) Run(ctx context.Context, requests <-chan Request) []*WorkerResult {
+func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackLatency bool) ([]*WorkerResult, func()) {
 	results := make([]*WorkerResult, wp.concurrency)
 	var wg sync.WaitGroup
 
 	for i := 0; i < wp.concurrency; i++ {
 		wg.Add(1)
 		res := &WorkerResult{}
-		for j := 0; j < 4; j++ {
+		for j := 0; j < 7; j++ {
 			// Pre-allocate slice latency để giảm re-allocation khi benchmark đang chạy
-			res.Ops[j].Latencies = make([]time.Duration, 0, 256)
+			if trackLatency {
+				res.Ops[j].Latencies = make([]time.Duration, 0, 256)
+			}
 		}
 		results[i] = res
 
 		go func(workerID int, result *WorkerResult) {
 			defer wg.Done()
-			workerLoop(ctx, wp.db, requests, result)
+			workerLoop(ctx, wp.db, requests, result, trackLatency)
 		}(i, results[i])
 	}
 
-	wg.Wait()
+	return results, func() { wg.Wait() }
+}
+
+// Run khởi chạy tất cả worker và chờ chúng hoàn thành.
+// Mỗi worker đọc request từ channel requests, thực thi lên database,
+// đo latency và lưu kết quả cục bộ.
+//
+// Run trả về danh sách WorkerResult từ tất cả worker sau khi channel
+// requests bị đóng hoặc ctx bị cancel.
+func (wp *WorkerPool) Run(ctx context.Context, requests <-chan Request, trackLatency bool) []*WorkerResult {
+	results, wait := wp.Start(ctx, requests, trackLatency)
+	wait()
 	return results
 }
 
@@ -71,7 +99,7 @@ func (wp *WorkerPool) Run(ctx context.Context, requests <-chan Request) []*Worke
 //
 // Latency chỉ đo thời gian thực thi database operation,
 // KHÔNG bao gồm thời gian request nằm chờ trong queue.
-func workerLoop(ctx context.Context, db Database, requests <-chan Request, result *WorkerResult) {
+func workerLoop(ctx context.Context, db Database, requests <-chan Request, result *WorkerResult, trackLatency bool) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -81,7 +109,7 @@ func workerLoop(ctx context.Context, db Database, requests <-chan Request, resul
 				// Channel đã đóng, không còn request mới
 				return
 			}
-			executeRequest(db, req, result)
+			executeRequest(db, req, result, trackLatency)
 		}
 	}
 }
@@ -93,7 +121,7 @@ func workerLoop(ctx context.Context, db Database, requests <-chan Request, resul
 // cascade: khi workerCtx hết hạn, DB calls đang in-flight sẽ KHÔNG bị cancel,
 // cho phép đo latency chính xác. go-redis built-in timeouts (ReadTimeout=3s)
 // cung cấp safety net chống hang.
-func executeRequest(db Database, req Request, result *WorkerResult) {
+func executeRequest(db Database, req Request, result *WorkerResult, trackLatency bool) {
 	ctx := context.Background()
 	start := time.Now()
 	var err error
@@ -102,27 +130,36 @@ func executeRequest(db Database, req Request, result *WorkerResult) {
 	case OpGet:
 		err = db.Get(ctx, req.Key)
 	case OpSet:
-		err = db.Set(ctx, req.Key, req.Value)
+		err = db.Set(ctx, req.Key, req.Payload)
 	case OpDelete:
 		err = db.Delete(ctx, req.Key)
-	case OpQuery:
+	case OpQueryTag, OpQueryNumeric, OpQueryOr, OpQueryPrefix:
 		err = db.Query(ctx, req.QueryStr)
 	}
 
 	latency := time.Since(start)
 	op := int(req.Operation)
-	
-	result.Ops[op].Completed++
 
-	if err != nil {
-		result.Ops[op].Errors++
-		if req.Operation == OpQuery {
-			log.Printf("[ERROR] %s query=%q err=%v", req.Operation, req.QueryStr, err)
-		} else {
-			log.Printf("[ERROR] %s key=%q err=%v", req.Operation, req.Key, err)
+	atomic.AddInt64(&result.Ops[op].Completed, 1)
+
+	if err == nil {
+		atomic.AddInt64(&result.Ops[op].Success, 1)
+		if trackLatency {
+			result.Ops[op].Latencies = append(result.Ops[op].Latencies, latency)
 		}
+		return
+	}
+
+	if errors.Is(err, ErrNotFound) {
+		// Miss nhanh hơn nhiều so với hit → không đưa vào phân bố latency để tránh làm lệch percentiles.
+		atomic.AddInt64(&result.Ops[op].NotFound, 1)
+		return
+	}
+
+	atomic.AddInt64(&result.Ops[op].Errors, 1)
+	if req.Operation >= OpQueryTag {
+		errLogger.Printf("[ERROR] %s query=%q err=%v", req.Operation, req.QueryStr, err)
 	} else {
-		result.Ops[op].Success++
-		result.Ops[op].Latencies = append(result.Ops[op].Latencies, latency)
+		errLogger.Printf("[ERROR] %s key=%q err=%v", req.Operation, req.Key, err)
 	}
 }

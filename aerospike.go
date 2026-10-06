@@ -2,49 +2,144 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	as "github.com/aerospike/aerospike-client-go/v7"
+	astypes "github.com/aerospike/aerospike-client-go/v7/types"
 )
 
 var tagRegex = regexp.MustCompile(`@(\w+):{([^}]+)}`)
 var numRegex = regexp.MustCompile(`@(\w+):\[(\d+)\s+(\d+)\]`)
+var prefixRegex = regexp.MustCompile(`@(\w+):(\w+)\*`)
+
+// defaultAerospikeTimeout khớp với ReadTimeout/WriteTimeout của Redis adapter.
+const defaultAerospikeTimeout = 3 * time.Second
 
 type AerospikeDB struct {
 	client    *as.Client
 	namespace string
 	setName   string
+	timeout   time.Duration
+
+	// Policy được tạo một lần và dùng chung (client chỉ đọc policy).
+	// Khi ctx có deadline ngắn hơn timeout, policy sẽ được copy và chỉnh riêng.
+	readPolicy  *as.BasePolicy
+	writePolicy *as.WritePolicy
+	queryPolicy *as.QueryPolicy
+}
+
+// parseAerospikeHost parse "host" hoặc "host:port" (mặc định port 3000).
+func parseAerospikeHost(s string) (*as.Host, error) {
+	host, port := s, 3000
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		host = s[:i]
+		p, err := strconv.Atoi(s[i+1:])
+		if err != nil {
+			return nil, fmt.Errorf("port không hợp lệ trong %q: %w", s, err)
+		}
+		port = p
+	}
+	if host == "" {
+		return nil, fmt.Errorf("host rỗng trong %q", s)
+	}
+	return as.NewHost(host, port), nil
 }
 
 func NewAerospikeDB(cfg AerospikeCfg) (*AerospikeDB, error) {
 	if len(cfg.Hosts) == 0 {
 		return nil, fmt.Errorf("không có host nào được cấu hình cho Aerospike")
 	}
-	hostPort := strings.Split(cfg.Hosts[0], ":")
-	host := hostPort[0]
-	port := 3000
-	if len(hostPort) > 1 {
-		p, err := strconv.Atoi(hostPort[1])
-		if err == nil {
-			port = p
+
+	// Truyền TẤT CẢ host làm seed: client vẫn kết nối được khi một node chết.
+	hosts := make([]*as.Host, 0, len(cfg.Hosts))
+	for _, h := range cfg.Hosts {
+		host, err := parseAerospikeHost(h)
+		if err != nil {
+			return nil, err
 		}
+		hosts = append(hosts, host)
+	}
+
+	timeout := cfg.Timeout.Duration
+	if timeout <= 0 {
+		timeout = defaultAerospikeTimeout
 	}
 
 	clientPolicy := as.NewClientPolicy()
-	client, err := as.NewClientWithPolicyAndHost(clientPolicy, as.NewHost(host, port))
+	clientPolicy.Timeout = 5 * time.Second // giống DialTimeout của Redis adapter
+	client, err := as.NewClientWithPolicyAndHost(clientPolicy, hosts...)
 	if err != nil {
 		return nil, err
 	}
 
+	readPolicy := as.NewPolicy()
+	readPolicy.TotalTimeout = timeout
+	readPolicy.SocketTimeout = timeout
+
+	writePolicy := as.NewWritePolicy(0, 0)
+	writePolicy.TotalTimeout = timeout
+	writePolicy.SocketTimeout = timeout
+
+	// Query policy tương đương FT.SEARCH ... TIMEOUT 2000 NOCONTENT LIMIT 0 10:
+	//   - IncludeBinData=false: chỉ trả về key/digest, giống NOCONTENT của Redis
+	//   - MaxRecords: giới hạn phía server, giống LIMIT của Redis
+	queryTimeout := time.Duration(queryTimeoutMs) * time.Millisecond
+	queryPolicy := as.NewQueryPolicy()
+	queryPolicy.TotalTimeout = queryTimeout
+	queryPolicy.SocketTimeout = queryTimeout
+	queryPolicy.IncludeBinData = false
+	queryPolicy.MaxRecords = queryResultLimit
+
 	return &AerospikeDB{
-		client:    client,
-		namespace: cfg.Namespace,
-		setName:   cfg.Set,
+		client:      client,
+		namespace:   cfg.Namespace,
+		setName:     cfg.Set,
+		timeout:     timeout,
+		readPolicy:  readPolicy,
+		writePolicy: writePolicy,
+		queryPolicy: queryPolicy,
 	}, nil
+}
+
+// ctxTimeout trả về timeout hiệu lực: min(def, thời gian còn lại của ctx).
+// Trả về lỗi nếu ctx đã bị huỷ/hết hạn.
+func ctxTimeout(ctx context.Context, def time.Duration) (time.Duration, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		if remain := time.Until(dl); remain < def {
+			if remain <= 0 {
+				return 0, context.DeadlineExceeded
+			}
+			return remain, nil
+		}
+	}
+	return def, nil
+}
+
+func (a *AerospikeDB) readPolicyFor(ctx context.Context) (*as.BasePolicy, error) {
+	t, err := ctxTimeout(ctx, a.readPolicy.TotalTimeout)
+	if err != nil || t == a.readPolicy.TotalTimeout {
+		return a.readPolicy, err
+	}
+	p := *a.readPolicy
+	p.TotalTimeout, p.SocketTimeout = t, t
+	return &p, nil
+}
+
+func (a *AerospikeDB) writePolicyFor(ctx context.Context) (*as.WritePolicy, error) {
+	t, err := ctxTimeout(ctx, a.writePolicy.TotalTimeout)
+	if err != nil || t == a.writePolicy.TotalTimeout {
+		return a.writePolicy, err
+	}
+	p := *a.writePolicy
+	p.TotalTimeout, p.SocketTimeout = t, t
+	return &p, nil
 }
 
 func (a *AerospikeDB) Name() string {
@@ -52,6 +147,9 @@ func (a *AerospikeDB) Name() string {
 }
 
 func (a *AerospikeDB) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !a.client.IsConnected() {
 		return fmt.Errorf("aerospike client disconnected")
 	}
@@ -89,69 +187,100 @@ func (a *AerospikeDB) Init(ctx context.Context) error {
 			return err
 		}
 		if task != nil {
-			<-task.OnComplete()
+			select {
+			case <-task.OnComplete():
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 	return nil
 }
 
 func (a *AerospikeDB) Get(ctx context.Context, keyStr string) error {
-	key, err := as.NewKey(a.namespace, a.setName, keyStr)
+	policy, err := a.readPolicyFor(ctx)
 	if err != nil {
 		return err
 	}
-	policy := as.NewPolicy()
-	_, err = a.client.Get(policy, key)
-	if err != nil && strings.Contains(err.Error(), "Key not found") {
-		return nil // Ignore not found for benchmark
+	key, kerr := as.NewKey(a.namespace, a.setName, keyStr)
+	if kerr != nil {
+		return kerr
 	}
-	return err
+	if _, gerr := a.client.Get(policy, key); gerr != nil {
+		if gerr.Matches(astypes.KEY_NOT_FOUND_ERROR) {
+			return ErrNotFound
+		}
+		return gerr
+	}
+	return nil
 }
 
-func (a *AerospikeDB) Set(ctx context.Context, keyStr string, value []byte) error {
-	key, err := as.NewKey(a.namespace, a.setName, keyStr)
+// Set ghi bins đã được dựng sẵn bởi generator (không parse JSON trong vùng đo latency).
+func (a *AerospikeDB) Set(ctx context.Context, keyStr string, payload *Payload) error {
+	policy, err := a.writePolicyFor(ctx)
 	if err != nil {
 		return err
 	}
-	var record Record
-	if err := json.Unmarshal(value, &record); err != nil {
-		return err
+	key, kerr := as.NewKey(a.namespace, a.setName, keyStr)
+	if kerr != nil {
+		return kerr
 	}
-
-	bins := as.BinMap{
-		"Dnn":          record.Dnn,
-		"IPType":       record.IPType,
-		"State":        record.State,
-		"Timer":        record.Timer,
-		"SEID":         record.SEID,
-		"startTime":    record.StartTime,
-		"attachTime":   record.AttachTime,
-		"FTEIDC":       record.FTEIDC,
-		"IP":           record.IP,
-		"SNSSAI":       record.SNSSAI,
-		"UpfSelection": record.UpfSelection,
-		"payload":      record.Payload,
-		"TEIDC":        record.TEIDC,
+	if perr := a.client.Put(policy, key, as.BinMap(payload.Bins)); perr != nil {
+		return perr
 	}
-	policy := as.NewWritePolicy(0, 0)
-	return a.client.Put(policy, key, bins)
+	return nil
 }
 
 func (a *AerospikeDB) Delete(ctx context.Context, keyStr string) error {
-	key, err := as.NewKey(a.namespace, a.setName, keyStr)
+	policy, err := a.writePolicyFor(ctx)
 	if err != nil {
 		return err
 	}
-	policy := as.NewWritePolicy(0, 0)
-	_, err = a.client.Delete(policy, key)
-	return err
+	key, kerr := as.NewKey(a.namespace, a.setName, keyStr)
+	if kerr != nil {
+		return kerr
+	}
+	existed, derr := a.client.Delete(policy, key)
+	if derr != nil {
+		return derr
+	}
+	if !existed {
+		return ErrNotFound
+	}
+	return nil
 }
 
-func (a *AerospikeDB) Query(ctx context.Context, query string) error {
-	stmt := as.NewStatement(a.namespace, a.setName)
+// parseQueryExpr parse chuỗi query RediSearch (TAG, NUMERIC, OR, PREFIX) sang Aerospike Filter và FilterExpression.
+func parseQueryExpr(query string) (*as.Filter, *as.Expression) {
+	if strings.Contains(query, "|") {
+		parts := strings.Split(query, "|")
+		var branchExps []*as.Expression
+		var sharedFilter *as.Filter
+		for i, part := range parts {
+			f, exp := parseSingleExpr(strings.TrimSpace(part))
+			if i == 0 && f != nil {
+				sharedFilter = f
+			}
+			if exp != nil {
+				branchExps = append(branchExps, exp)
+			}
+		}
+		if len(branchExps) == 1 {
+			return sharedFilter, branchExps[0]
+		} else if len(branchExps) > 1 {
+			// Đối với OR query, Aerospike không thể dùng 1 Secondary Index duy nhất
+			// cho 2 nhánh khác nhau → huỷ sharedFilter để chuyển sang Set Scan + ExpOr
+			return nil, as.ExpOr(branchExps...)
+		}
+		return sharedFilter, nil
+	}
+	return parseSingleExpr(query)
+}
 
+func parseSingleExpr(query string) (*as.Filter, *as.Expression) {
 	tags := tagRegex.FindAllStringSubmatch(query, -1)
 	nums := numRegex.FindAllStringSubmatch(query, -1)
+	prefixes := prefixRegex.FindAllStringSubmatch(query, -1)
 
 	var exps []*as.Expression
 	var siFilter *as.Filter
@@ -176,9 +305,10 @@ func (a *AerospikeDB) Query(ctx context.Context, query string) error {
 			exps = append(exps, as.ExpLessEq(as.ExpIntBin(bin), as.ExpIntVal(max)))
 		}
 	}
-
-	if siFilter != nil {
-		stmt.SetFilter(siFilter)
+	for _, match := range prefixes {
+		bin := match[1]
+		prefix := match[2]
+		exps = append(exps, as.ExpRegexCompare("^"+prefix+".*", 0, as.ExpStringBin(bin)))
 	}
 
 	var finalExp *as.Expression
@@ -188,24 +318,50 @@ func (a *AerospikeDB) Query(ctx context.Context, query string) error {
 		finalExp = as.ExpAnd(exps...)
 	}
 
-	policy := as.NewQueryPolicy()
-	policy.FilterExpression = finalExp
+	return siFilter, finalExp
+}
 
-	rs, err := a.client.Query(policy, stmt)
+func (a *AerospikeDB) Query(ctx context.Context, query string) error {
+	timeout, err := ctxTimeout(ctx, a.queryPolicy.TotalTimeout)
 	if err != nil {
 		return err
 	}
 
+	stmt := as.NewStatement(a.namespace, a.setName)
+	siFilter, filterExp := parseQueryExpr(query)
+
+	if siFilter != nil {
+		stmt.SetFilter(siFilter)
+	}
+
+	// Copy policy dùng chung để gắn FilterExpression/timeout riêng cho query này.
+	policy := *a.queryPolicy
+	policy.TotalTimeout, policy.SocketTimeout = timeout, timeout
+	policy.FilterExpression = filterExp
+
+	rs, qerr := a.client.Query(&policy, stmt)
+	if qerr != nil {
+		return qerr
+	}
+	defer rs.Close()
+
+	results := rs.Results()
 	count := 0
-	for res := range rs.Results() {
-		if res.Err != nil {
-			return res.Err
-		}
-		count++
-		if count >= 10 {
-			rs.Close()
-			break
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case res, ok := <-results:
+			if !ok {
+				return nil
+			}
+			if res.Err != nil {
+				return res.Err
+			}
+			count++
+			if count >= queryResultLimit {
+				return nil
+			}
 		}
 	}
-	return nil
 }
