@@ -12,9 +12,12 @@ import (
 	astypes "github.com/aerospike/aerospike-client-go/v7/types"
 )
 
-var tagRegex = regexp.MustCompile(`@(\w+):{([^}]+)}`)
+// tagRegex: @field:{value} (loại trừ value chứa '*' — đó là prefix query).
+var tagRegex = regexp.MustCompile(`@(\w+):\{([^}*]+)\}`)
 var numRegex = regexp.MustCompile(`@(\w+):\[(\d+)\s+(\d+)\]`)
-var prefixRegex = regexp.MustCompile(`@(\w+):(\w+)\*`)
+
+// prefixRegex: @field:{prefix*} (cú pháp prefix trên TAG field của RediSearch).
+var prefixRegex = regexp.MustCompile(`@(\w+):\{([^}*]+)\*\}`)
 
 // defaultAerospikeTimeout khớp với ReadTimeout/WriteTimeout của Redis adapter.
 const defaultAerospikeTimeout = 3 * time.Second
@@ -215,7 +218,7 @@ func (a *AerospikeDB) Get(ctx context.Context, keyStr string) error {
 	return nil
 }
 
-// Set ghi bins đã được dựng sẵn bởi generator (không parse JSON trong vùng đo latency).
+// Set ghi bins đã được dựng sẵn bởi generator (không cần xử lý trong vùng đo latency).
 func (a *AerospikeDB) Set(ctx context.Context, keyStr string, payload *Payload) error {
 	policy, err := a.writePolicyFor(ctx)
 	if err != nil {
@@ -251,33 +254,33 @@ func (a *AerospikeDB) Delete(ctx context.Context, keyStr string) error {
 }
 
 // parseQueryExpr parse chuỗi query RediSearch (TAG, NUMERIC, OR, PREFIX) sang Aerospike Filter và FilterExpression.
+//
+// OR query: Aerospike chỉ dùng được tối đa 1 Secondary Index/query nên không thể
+// phục vụ nhiều nhánh bằng SI → mọi điều kiện của mọi nhánh đều chuyển thành
+// expression, gộp bằng ExpOr, và query chạy dạng set scan.
 func parseQueryExpr(query string) (*as.Filter, *as.Expression) {
 	if strings.Contains(query, "|") {
-		parts := strings.Split(query, "|")
 		var branchExps []*as.Expression
-		var sharedFilter *as.Filter
-		for i, part := range parts {
-			f, exp := parseSingleExpr(strings.TrimSpace(part))
-			if i == 0 && f != nil {
-				sharedFilter = f
-			}
-			if exp != nil {
+		for _, part := range strings.Split(query, "|") {
+			if _, exp := parseSingleExpr(part, false); exp != nil {
 				branchExps = append(branchExps, exp)
 			}
 		}
-		if len(branchExps) == 1 {
-			return sharedFilter, branchExps[0]
-		} else if len(branchExps) > 1 {
-			// Đối với OR query, Aerospike không thể dùng 1 Secondary Index duy nhất
-			// cho 2 nhánh khác nhau → huỷ sharedFilter để chuyển sang Set Scan + ExpOr
+		switch len(branchExps) {
+		case 0:
+			return nil, nil
+		case 1:
+			return nil, branchExps[0]
+		default:
 			return nil, as.ExpOr(branchExps...)
 		}
-		return sharedFilter, nil
 	}
-	return parseSingleExpr(query)
+	return parseSingleExpr(query, true)
 }
 
-func parseSingleExpr(query string) (*as.Filter, *as.Expression) {
+// parseSingleExpr parse một nhánh AND. useSI=true: điều kiện TAG/NUMERIC đầu tiên
+// dùng Secondary Index, phần còn lại là expression. useSI=false: tất cả là expression.
+func parseSingleExpr(query string, useSI bool) (*as.Filter, *as.Expression) {
 	tags := tagRegex.FindAllStringSubmatch(query, -1)
 	nums := numRegex.FindAllStringSubmatch(query, -1)
 	prefixes := prefixRegex.FindAllStringSubmatch(query, -1)
@@ -288,7 +291,7 @@ func parseSingleExpr(query string) (*as.Filter, *as.Expression) {
 	for _, match := range tags {
 		bin := match[1]
 		val := match[2]
-		if siFilter == nil {
+		if useSI && siFilter == nil {
 			siFilter = as.NewEqualFilter(bin, val)
 		} else {
 			exps = append(exps, as.ExpEq(as.ExpStringBin(bin), as.ExpStringVal(val)))
@@ -298,7 +301,7 @@ func parseSingleExpr(query string) (*as.Filter, *as.Expression) {
 		bin := match[1]
 		min, _ := strconv.ParseInt(match[2], 10, 64)
 		max, _ := strconv.ParseInt(match[3], 10, 64)
-		if siFilter == nil {
+		if useSI && siFilter == nil {
 			siFilter = as.NewRangeFilter(bin, min, max)
 		} else {
 			exps = append(exps, as.ExpGreaterEq(as.ExpIntBin(bin), as.ExpIntVal(min)))
@@ -307,8 +310,8 @@ func parseSingleExpr(query string) (*as.Filter, *as.Expression) {
 	}
 	for _, match := range prefixes {
 		bin := match[1]
-		prefix := match[2]
-		exps = append(exps, as.ExpRegexCompare("^"+prefix+".*", 0, as.ExpStringBin(bin)))
+		prefix := regexp.QuoteMeta(match[2])
+		exps = append(exps, as.ExpRegexCompare("^"+prefix, 0, as.ExpStringBin(bin)))
 	}
 
 	var finalExp *as.Expression

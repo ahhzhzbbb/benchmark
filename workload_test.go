@@ -3,9 +3,28 @@ package main
 import (
 	"encoding/json"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// hashToMap chuyển payload HSET (f1, v1, f2, v2, ...) thành map để kiểm tra.
+func hashToMap(t *testing.T, p *Payload) map[string]string {
+	t.Helper()
+	if p == nil || len(p.Hash) == 0 || len(p.Hash)%2 != 0 {
+		t.Fatalf("invalid hash payload: %v", p)
+	}
+	m := make(map[string]string, len(p.Hash)/2)
+	for i := 0; i < len(p.Hash); i += 2 {
+		k, ok1 := p.Hash[i].(string)
+		v, ok2 := p.Hash[i+1].(string)
+		if !ok1 || !ok2 {
+			t.Fatalf("hash field/value must be strings: %v=%v", p.Hash[i], p.Hash[i+1])
+		}
+		m[k] = v
+	}
+	return m
+}
 
 // TestGenerateRecordDiversity kiểm tra dữ liệu sinh ra có đa dạng
 func TestGenerateRecordDiversity(t *testing.T) {
@@ -99,19 +118,19 @@ func TestLoadGeneratorDiversity(t *testing.T) {
 	gen := NewLoadGenerator(cfg)
 
 	stateCount := make(map[string]int)
-	var records []Record
+	var records []map[string]string
 
 	for {
 		req, hasMore := gen.Next()
 		if !hasMore {
 			break
 		}
-		var rec Record
-		if err := json.Unmarshal([]byte(req.Payload.JSON), &rec); err != nil {
-			t.Fatalf("invalid JSON payload: %v", err)
+		rec := hashToMap(t, req.Payload)
+		if len(rec) != 13 {
+			t.Fatalf("expected 13 hash fields, got %d", len(rec))
 		}
 		records = append(records, rec)
-		stateCount[rec.State]++
+		stateCount[rec["State"]]++
 	}
 
 	if len(records) != cfg.Data.KeyCount {
@@ -124,9 +143,7 @@ func TestLoadGeneratorDiversity(t *testing.T) {
 	}
 
 	// Kiểm tra record đầu và cuối khác nhau
-	j1, _ := json.Marshal(records[0])
-	j2, _ := json.Marshal(records[len(records)-1])
-	if string(j1) == string(j2) {
+	if reflect.DeepEqual(records[0], records[len(records)-1]) {
 		t.Error("First and last records are identical — data is not diverse")
 	}
 
@@ -149,13 +166,10 @@ func TestSetKeepsSEIDMatchingKey(t *testing.T) {
 
 	for i := 0; i < 5000; i++ {
 		req, _ := gen.Next()
-		var rec Record
-		if err := json.Unmarshal([]byte(req.Payload.JSON), &rec); err != nil {
-			t.Fatalf("invalid JSON: %v", err)
-		}
+		rec := hashToMap(t, req.Payload)
 		id := strings.TrimPrefix(req.Key, "bench:key:")
-		if rec.SEID != "SEID_"+id {
-			t.Fatalf("key %s has SEID %s", req.Key, rec.SEID)
+		if rec["SEID"] != "SEID_"+id {
+			t.Fatalf("key %s has SEID %s", req.Key, rec["SEID"])
 		}
 	}
 }
@@ -284,5 +298,24 @@ func TestParseAerospikeHost(t *testing.T) {
 	}
 	if _, err := parseAerospikeHost("host:abc"); err == nil {
 		t.Error("expected error for bad port")
+	}
+}
+
+// TestParseQueryExpr kiểm tra việc dịch cú pháp RediSearch sang Aerospike.
+func TestParseQueryExpr(t *testing.T) {
+	// AND thường: điều kiện đầu dùng SI, điều kiện sau là expression.
+	if f, e := parseQueryExpr("@FTEIDC:{FTEIDC_1} @State:{State_2}"); f == nil || e == nil {
+		t.Errorf("AND query: want filter+expr, got %v, %v", f, e)
+	}
+	// OR mà mỗi nhánh chỉ có 1 TAG: cả hai nhánh phải thành expression, không dùng SI.
+	if f, e := parseQueryExpr("(@FTEIDC:{FTEIDC_1}) | (@FTEIDC:{FTEIDC_2})"); f != nil || e == nil {
+		t.Errorf("OR query: want no filter + expr, got %v, %v", f, e)
+	}
+	// Prefix trên TAG: không được bị nhận nhầm thành equality filter.
+	if tagRegex.MatchString("@Dnn:{Dnn_9*}") {
+		t.Error("tagRegex must not match prefix query")
+	}
+	if f, e := parseQueryExpr("@Dnn:{Dnn_9*}"); f != nil || e == nil {
+		t.Errorf("prefix query: want no filter + expr, got %v, %v", f, e)
 	}
 }

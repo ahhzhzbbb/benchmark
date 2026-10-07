@@ -251,7 +251,7 @@ func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 
 	// Chạy worker pool (blocking đến khi tất cả worker hoàn thành hoặc ctx hết hạn)
 	results := wp.Run(workerCtx, requests, true)
-	<-rcDone // sync: đảm bảo genDuration đã được ghi trước khi đọc (happens-before)
+	<-rcDone                            // sync: đảm bảo genDuration đã được ghi trước khi đọc (happens-before)
 	workerDuration := time.Since(start) // thời gian thực tế workers chạy (bao gồm grace period)
 
 	// Tổng hợp kết quả với 2 duration riêng biệt:

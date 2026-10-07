@@ -3,7 +3,7 @@
 # Chạy: ./benchmarkDB --config config.yaml
 
 database:
-  type: aerospike # Loại database: "redis" hoặc "aerospike" (phase 2)
+  type: aersopsike # Loại database: "redis" hoặc "aerospike" (phase 2)
 
 # Cấu hình Redis Cluster
 redis:

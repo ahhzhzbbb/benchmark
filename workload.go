@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -192,6 +191,27 @@ func recordToBins(rec Record) map[string]interface{} {
 	}
 }
 
+// recordToHash chuyển Record thành danh sách field/value cho Redis HSET.
+// Thứ tự field cố định để đảm bảo deterministic. Giá trị số được convert
+// sẵn sang string tại đây (ngoài vùng đo latency).
+func recordToHash(rec Record) []interface{} {
+	return []interface{}{
+		"Dnn", rec.Dnn,
+		"IPType", rec.IPType,
+		"State", rec.State,
+		"Timer", strconv.Itoa(rec.Timer),
+		"SEID", rec.SEID,
+		"startTime", strconv.FormatInt(rec.StartTime, 10),
+		"attachTime", strconv.FormatInt(rec.AttachTime, 10),
+		"FTEIDC", rec.FTEIDC,
+		"IP", rec.IP,
+		"SNSSAI", rec.SNSSAI,
+		"UpfSelection", strconv.FormatInt(rec.UpfSelection, 10),
+		"payload", rec.Payload,
+		"TEIDC", rec.TEIDC,
+	}
+}
+
 // makePayload dựng payload ở định dạng mà database đích cần.
 // Được gọi trong generator (ngoài vùng đo latency), nên chi phí serialize
 // không bị tính vào latency của database.
@@ -199,8 +219,7 @@ func makePayload(rec Record, dbType string) *Payload {
 	if dbType == "aerospike" {
 		return &Payload{Bins: recordToBins(rec)}
 	}
-	b, _ := json.Marshal(rec)
-	return &Payload{JSON: string(b)}
+	return &Payload{Hash: recordToHash(rec)}
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +241,7 @@ type WorkloadGenerator struct {
 	queriesTag       []string // pre-defined query tag patterns
 	queriesNumeric   []string // pre-defined query numeric patterns
 	queriesOr        []string // pre-defined query OR patterns
-	queriesPrefix     []string // pre-defined query prefix patterns
+	queriesPrefix    []string // pre-defined query prefix patterns
 	getRatio         float64  // tỉ lệ tích luỹ: [0, getRatio) → GET
 	setRatio         float64  // tỉ lệ tích luỹ: [getRatio, setRatio) → SET
 	delRatio         float64  // tỉ lệ tích luỹ: [setRatio, delRatio) → DELETE
@@ -331,14 +350,15 @@ func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *Workloa
 	for i := 0; i < queryPoolSize; i++ {
 		pattern := queryRng.Intn(4)
 		switch pattern {
+		// Prefix trên TAG field phải dùng cú pháp @field:{prefix*}
 		case 0:
-			queriesPrefix = append(queriesPrefix, "@Dnn:Dnn_"+strconv.Itoa(queryRng.Intn(10))+"*")
+			queriesPrefix = append(queriesPrefix, "@Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(10))+"*}")
 		case 1:
-			queriesPrefix = append(queriesPrefix, "@FTEIDC:FTEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*")
+			queriesPrefix = append(queriesPrefix, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*}")
 		case 2:
-			queriesPrefix = append(queriesPrefix, "@TEIDC:TEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*")
+			queriesPrefix = append(queriesPrefix, "@TEIDC:{TEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*}")
 		case 3:
-			queriesPrefix = append(queriesPrefix, "@IP:IP_"+strconv.Itoa(queryRng.Intn(10))+"*")
+			queriesPrefix = append(queriesPrefix, "@IP:{IP_"+strconv.Itoa(queryRng.Intn(10))+"*}")
 		}
 	}
 

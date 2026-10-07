@@ -36,7 +36,7 @@ type RedisCfg struct {
 
 // AerospikeCfg chứa cấu hình kết nối Aerospike.
 type AerospikeCfg struct {
-	Hosts     []string `yaml:"hosts"`     // Tất cả host đều được dùng làm seed node
+	Hosts     []string `yaml:"hosts"` // Tất cả host đều được dùng làm seed node
 	Namespace string   `yaml:"namespace"`
 	Set       string   `yaml:"set"`
 	Timeout   Duration `yaml:"timeout"` // Timeout cho GET/SET/DELETE (mặc định 3s, giống Redis)
@@ -106,6 +106,7 @@ func LoadConfig() (Config, error) {
 	tpsOverride := flag.Int("tps", 0, "Override Target TPS (0 to use config file value)")
 	concurrencyOverride := flag.Int("concurrency", 0, "Override max concurrency / number of workers (0 to use config file value)")
 	modeStr := flag.String("mode", "run", "Chế độ chạy: 'load' (đổ dữ liệu), 'run' (benchmark) hoặc 'open-loop' (đo lường liên tục)")
+	engineOverride := flag.String("engine", "", "Override database engine (redis hoặc aerospike)")
 	getOverride := flag.Int("get", -1, "Override GET workload ratio (-1 to use config file value)")
 	setOverride := flag.Int("set", -1, "Override SET workload ratio (-1 to use config file value)")
 	deleteOverride := flag.Int("delete", -1, "Override DELETE workload ratio (-1 to use config file value)")
@@ -130,6 +131,10 @@ func LoadConfig() (Config, error) {
 
 	// Gán Mode từ cờ command line sau khi load config để đảm bảo ưu tiên cờ
 	cfg.Mode = *modeStr
+
+	if *engineOverride != "" {
+		cfg.Database.Type = *engineOverride
+	}
 
 	if *tpsOverride > 0 {
 		cfg.Load.TargetTPS = *tpsOverride

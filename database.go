@@ -14,7 +14,7 @@ var ErrNotFound = errors.New("key not found")
 // Payload được dựng NGOÀI vùng đo latency (trong generator), nên adapter
 // chỉ cần gửi đi mà không phải serialize/parse — đảm bảo công bằng giữa các DB.
 type Payload struct {
-	JSON string                 // Dùng cho Redis (JSON.SET)
+	Hash []interface{}          // Dùng cho Redis (HSET key f1 v1 f2 v2 ...), giá trị đã convert sẵn sang string
 	Bins map[string]interface{} // Dùng cho Aerospike (Put BinMap)
 }
 

@@ -22,6 +22,10 @@ type RedisDB struct {
 	masters []*redis.Client
 }
 
+// redisIndexName là tên index RediSearch trên HASH. Dùng tên mới (khác "idx"
+// của bản RedisJSON cũ) để FT.CREATE không bị bỏ qua vì "Index already exists".
+const redisIndexName = "idx_hash"
+
 func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
 	poolSize := maxConcurrency * 2
 	if poolSize < 100 {
@@ -41,18 +45,23 @@ func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
 	return &RedisDB{client: rdb}, nil
 }
 
-// Get đọc giá trị của key từ Redis (dưới dạng JSON).
+// Get đọc toàn bộ record (HGETALL), tương đương Aerospike Get đọc tất cả bins.
+// HGETALL trả về map rỗng khi key không tồn tại → ErrNotFound.
 func (r *RedisDB) Get(ctx context.Context, key string) error {
-	err := r.client.Do(ctx, "JSON.GET", key).Err()
-	if err == redis.Nil {
+	m, err := r.client.HGetAll(ctx, key).Result()
+	if err != nil {
+		return err
+	}
+	if len(m) == 0 {
 		return ErrNotFound
 	}
-	return err
+	return nil
 }
 
-// Set ghi JSON đã được serialize sẵn vào key.
+// Set ghi record bằng HSET với danh sách field/value đã dựng sẵn.
+// Mọi SET đều ghi đủ 13 field nên HSET tương đương ghi đè toàn bộ record.
 func (r *RedisDB) Set(ctx context.Context, key string, payload *Payload) error {
-	return r.client.Do(ctx, "JSON.SET", key, "$", payload.JSON).Err()
+	return r.client.HSet(ctx, key, payload.Hash...).Err()
 }
 
 // Delete xoá key khỏi Redis. Trả về ErrNotFound nếu key không tồn tại.
@@ -82,7 +91,7 @@ func (r *RedisDB) Name() string {
 	return "Redis Cluster"
 }
 
-// Init khởi tạo index RediSearch cho Redis.
+// Init khởi tạo index RediSearch trên HASH cho Redis.
 func (r *RedisDB) Init(ctx context.Context) error {
 	var mu sync.Mutex
 	// Reset danh sách masters mỗi lần init
@@ -97,19 +106,19 @@ func (r *RedisDB) Init(ctx context.Context) error {
 		r.masters = append(r.masters, client)
 		mu.Unlock()
 
-		err := client.Do(ctx, "FT.CREATE", "idx", "ON", "JSON", "PREFIX", "1", "bench:key:", "SCHEMA",
-			"$.Dnn", "AS", "Dnn", "TAG",
-			"$.IPType", "AS", "IPType", "TAG",
-			"$.State", "AS", "State", "TAG",
-			"$.Timer", "AS", "Timer", "NUMERIC",
-			"$.SEID", "AS", "SEID", "TAG",
-			"$.startTime", "AS", "startTime", "NUMERIC",
-			"$.attachTime", "AS", "attachTime", "NUMERIC",
-			"$.FTEIDC", "AS", "FTEIDC", "TAG",
-			"$.IP", "AS", "IP", "TAG",
-			"$.SNSSAI", "AS", "SNSSAI", "TAG",
-			"$.UpfSelection", "AS", "UpfSelection", "NUMERIC",
-			"$.TEIDC", "AS", "TEIDC", "TAG").Err()
+		err := client.Do(ctx, "FT.CREATE", redisIndexName, "ON", "HASH", "PREFIX", "1", "bench:key:", "SCHEMA",
+			"Dnn", "TAG",
+			"IPType", "TAG",
+			"State", "TAG",
+			"Timer", "NUMERIC",
+			"SEID", "TAG",
+			"startTime", "NUMERIC",
+			"attachTime", "NUMERIC",
+			"FTEIDC", "TAG",
+			"IP", "TAG",
+			"SNSSAI", "TAG",
+			"UpfSelection", "NUMERIC",
+			"TEIDC", "TAG").Err()
 
 		if err != nil && strings.Contains(err.Error(), "Index already exists") {
 			return nil
@@ -121,7 +130,7 @@ func (r *RedisDB) Init(ctx context.Context) error {
 // searchArgs tạo tham số FT.SEARCH. NOCONTENT: chỉ trả về id, giảm I/O mạng.
 func searchArgs(query string) []interface{} {
 	return []interface{}{
-		"FT.SEARCH", "idx", query,
+		"FT.SEARCH", redisIndexName, query,
 		"TIMEOUT", strconv.Itoa(queryTimeoutMs),
 		"NOCONTENT",
 		"LIMIT", "0", strconv.Itoa(queryResultLimit),

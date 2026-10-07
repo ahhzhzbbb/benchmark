@@ -4,7 +4,7 @@
 `BenchmarkDB` là một công cụ mã nguồn mở được viết bằng ngôn ngữ Go, chuyên dụng để đo lường hiệu năng (benchmark) của các hệ thống cơ sở dữ liệu. Điểm đặc biệt của công cụ này là sử dụng mô hình **open-loop benchmark**: tốc độ phát request được điều khiển bởi Rate Controller trung tâm, **độc lập với database latency**. Điều này đảm bảo kết quả benchmark phản ánh đúng khả năng chịu tải thực tế của database, không bị ảnh hưởng bởi closed-loop bias (tình trạng công cụ test tự động chạy chậm lại khi DB phản hồi chậm).
 
 Hiện tại, công cụ hỗ trợ:
-- **Redis Cluster** (Hỗ trợ RedisJSON và RediSearch cho truy vấn phức tạp).
+- **Redis Cluster** (Lưu dữ liệu dạng HASH, dùng RediSearch cho truy vấn phức tạp).
 - **Aerospike** (Hỗ trợ Secondary Indexes cho truy vấn).
 
 Mô hình dữ liệu giả lập được thiết kế tối ưu để mô phỏng dữ liệu mạng lõi viễn thông (5G SMF Session).
@@ -63,7 +63,7 @@ Mô hình dữ liệu giả lập được thiết kế tối ưu để mô ph�
 | `main.go` | Điểm khởi chạy: parse config, tạo DB adapter, quản lý tín hiệu thoát và chạy Runner |
 | `config.go` | Xử lý cấu hình từ file YAML và CLI Flags |
 | `database.go` | Định nghĩa interface `Database` trừu tượng và các loại `OperationType` |
-| `redis.go` | Redis Cluster adapter (RedisJSON, RediSearch) |
+| `redis.go` | Redis Cluster adapter (HASH: HGETALL/HSET, RediSearch index ON HASH) |
 | `aerospike.go` | Aerospike adapter (Secondary Indexes, Filters) |
 | `workload.go` | Sinh request ngẫu nhiên theo tỉ lệ phân bổ (GET/SET/DELETE/QUERY) bằng pre-generated pool |
 | `rate_controller.go` | Scheduler chính điều khiển tốc độ (Open-loop) |
