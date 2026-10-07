@@ -2,24 +2,15 @@ package main
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisDB là adapter implement Database interface cho Redis Cluster.
-//
-// Lưu ý về RediSearch trên Redis Cluster (OSS, không có coordinator):
-// mỗi master chỉ index phần dữ liệu thuộc các hash slot của nó. Vì vậy
-// FT.SEARCH phải được gửi tới TẤT CẢ master (scatter-gather) thì mới có
-// kết quả đầy đủ trên toàn bộ dataset.
 type RedisDB struct {
-	client  *redis.ClusterClient
-	masters []*redis.Client
+	client *redis.ClusterClient
 }
 
 // redisIndexName là tên index RediSearch trên HASH. Dùng tên mới (khác "idx"
@@ -93,18 +84,10 @@ func (r *RedisDB) Name() string {
 
 // Init khởi tạo index RediSearch trên HASH cho Redis.
 func (r *RedisDB) Init(ctx context.Context) error {
-	var mu sync.Mutex
-	// Reset danh sách masters mỗi lần init
-	r.masters = make([]*redis.Client, 0)
-
 	return r.client.ForEachMaster(ctx, func(ctx context.Context, client *redis.Client) error {
 		if err := client.Ping(ctx).Err(); err != nil {
 			return nil // Bỏ qua node bị lỗi kết nối
 		}
-
-		mu.Lock()
-		r.masters = append(r.masters, client)
-		mu.Unlock()
 
 		err := client.Do(ctx, "FT.CREATE", redisIndexName, "ON", "HASH", "PREFIX", "1", "bench:key:", "SCHEMA",
 			"Dnn", "TAG",
@@ -137,31 +120,10 @@ func searchArgs(query string) []interface{} {
 	}
 }
 
-// Query thực thi truy vấn RediSearch theo mô hình scatter-gather:
-// gửi song song tới tất cả master và chờ tất cả trả lời.
-// Latency đo được = latency của shard chậm nhất, đúng với chi phí thực tế
-// mà client phải trả để có kết quả đầy đủ.
+// Query thực thi truy vấn RediSearch.
+// Từ Redis 8.0 OSS trở đi (hoặc khi có server-side coordinator),
+// server sẽ tự động fan-out query tới các shard và tổng hợp kết quả.
+// Tool benchmark chỉ cần gửi 1 lệnh duy nhất qua ClusterClient.
 func (r *RedisDB) Query(ctx context.Context, query string) error {
-	switch len(r.masters) {
-	case 0:
-		// Chưa lấy được danh sách master (Init lỗi) — fallback, kết quả có thể không đầy đủ.
-		return r.client.Do(ctx, searchArgs(query)...).Err()
-	case 1:
-		return r.masters[0].Do(ctx, searchArgs(query)...).Err()
-	}
-
-	errs := make([]error, len(r.masters))
-	var wg sync.WaitGroup
-	// Gửi tới master[1..n-1] trong goroutine, master[0] chạy ngay trên goroutine hiện tại.
-	for i := 1; i < len(r.masters); i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			errs[i] = r.masters[i].Do(ctx, searchArgs(query)...).Err()
-		}(i)
-	}
-	errs[0] = r.masters[0].Do(ctx, searchArgs(query)...).Err()
-	wg.Wait()
-
-	return errors.Join(errs...)
+	return r.client.Do(ctx, searchArgs(query)...).Err()
 }
