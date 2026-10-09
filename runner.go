@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync/atomic"
 	"time"
 )
@@ -326,19 +327,20 @@ func (r *Runner) runOpenLoop(ctx context.Context) {
 		close(rcDone)
 	}()
 
-	// Chạy worker pool ngầm không thu thập latency (trackLatency = false)
-	// Start trả về mảng con trỏ kết quả và một hàm Wait
-	results, wait := wp.Start(ctx, requests, false)
+	// Chạy worker pool với trackLatency = true để tính P50/P95/P99 latency real-time
+	results, wait := wp.Start(ctx, requests, true)
 
 	// Bắt đầu Reporter loop
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastTotalSlip int64
+	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastScheduled int64
 	startTime := time.Now()
 
 	fmt.Println("\n--- Open-Loop Mode ---")
-	fmt.Printf("Target TPS: %d\n\n", r.cfg.Load.TargetTPS)
+	fmt.Printf("Target TPS:     %d\n", r.cfg.Load.TargetTPS)
+	fmt.Printf("Concurrency:    %d workers\n", r.cfg.Load.MaxConcurrency)
+	fmt.Printf("Queue Size:     %d\n\n", r.cfg.Load.QueueSize)
 
 reporterLoop:
 	for {
@@ -347,46 +349,59 @@ reporterLoop:
 			break reporterLoop
 		case <-ticker.C:
 			var currentSuccess, currentNotFound, currentErrors int64
+			var currentLatencies []time.Duration
+
 			// Tổng hợp từ các worker
 			for _, res := range results {
 				for i := 0; i < 7; i++ {
 					currentSuccess += atomic.LoadInt64(&res.Ops[i].Success)
 					currentNotFound += atomic.LoadInt64(&res.Ops[i].NotFound)
 					currentErrors += atomic.LoadInt64(&res.Ops[i].Errors)
+					currentLatencies = append(currentLatencies, res.Ops[i].Latencies...)
 				}
 			}
+
+			currentScheduled := rc.Scheduled()
 			currentDropped := rc.Dropped()
 			currentIssued := rc.Issued()
-			currentTotalSlip := rc.TotalSlip()
-
-			sentTPS := currentIssued - lastIssued
-			successTPS := currentSuccess - lastSuccess
-			notFoundTPS := currentNotFound - lastNotFound
-			errorTPS := currentErrors - lastErrors
-
-			totalAckTPS := successTPS + notFoundTPS + errorTPS
-			errorRate := 0.0
-			if totalAckTPS > 0 {
-				errorRate = float64(errorTPS) / float64(totalAckTPS) * 100
+			currentCompleted := currentSuccess + currentNotFound + currentErrors
+			inFlight := currentIssued - currentCompleted
+			if inFlight < 0 {
+				inFlight = 0
 			}
 
-			// Tính Slip (Delay) trung bình trong 1 giây qua
-			slipDelta := currentTotalSlip - lastTotalSlip
-			avgSlipMs := 0.0
-			if sentTPS > 0 {
-				avgSlipMs = float64(slipDelta) / float64(sentTPS) / 1e6
+			schedTPS := currentScheduled - lastScheduled
+			sentTPS := currentIssued - lastIssued
+			lastCompleted := lastSuccess + lastNotFound + lastErrors
+			ackTPS := currentCompleted - lastCompleted
+			errorTPS := currentErrors - lastErrors
+
+			errorRate := 0.0
+			if ackTPS > 0 {
+				errorRate = float64(errorTPS) / float64(ackTPS) * 100
+			}
+
+			// Tính latency percentiles tích luỹ
+			var p50, p95, p99 time.Duration
+			if len(currentLatencies) > 0 {
+				sort.Slice(currentLatencies, func(i, j int) bool {
+					return currentLatencies[i] < currentLatencies[j]
+				})
+				p50 = percentile(currentLatencies, 50)
+				p95 = percentile(currentLatencies, 95)
+				p99 = percentile(currentLatencies, 99)
 			}
 
 			elapsed := time.Since(startTime)
-			fmt.Printf("[%02d:%02d:%02d] Sent: %5d TPS | Ack: %5d TPS (Err: %4d, %5.2f%% | NotFound: %4d) | Dropped: %d | Slip: %5.2fms\n",
+			fmt.Printf("[%02d:%02d:%02d] Sched: %5d/s | Sent: %5d/s | Ack: %5d/s (Err: %4d, %5.2f%%) | Drop: %d | InFlight: %4d | P50: %v | P95: %v | P99: %v\n",
 				int(elapsed.Hours()), int(elapsed.Minutes())%60, int(elapsed.Seconds())%60,
-				sentTPS, totalAckTPS, errorTPS, errorRate, notFoundTPS, currentDropped, avgSlipMs)
+				schedTPS, sentTPS, ackTPS, errorTPS, errorRate, currentDropped, inFlight, p50, p95, p99)
 
+			lastScheduled = currentScheduled
 			lastSuccess = currentSuccess
 			lastNotFound = currentNotFound
 			lastErrors = currentErrors
 			lastIssued = currentIssued
-			lastTotalSlip = currentTotalSlip
 		}
 	}
 

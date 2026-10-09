@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrNotFound được adapter trả về khi GET/DELETE nhắm vào key không tồn tại.
@@ -61,8 +62,9 @@ func (op OperationType) String() string {
 type Request struct {
 	Operation OperationType
 	Key       string
-	Payload   *Payload // Chỉ dùng cho OpSet, nil cho OpGet/OpDelete/OpQuery...
-	QueryStr  string   // Dùng cho OpQueryTag, OpQueryNumeric
+	Payload   *Payload  // Chỉ dùng cho OpSet, nil cho OpGet/OpDelete/OpQuery...
+	QueryStr  string    // Dùng cho OpQueryTag, OpQueryNumeric
+	CreatedAt time.Time // Thời điểm request được phát ra (dùng để đo end-to-end latency gồm cả queue time)
 }
 
 // Database là interface trừu tượng cho mọi database backend.

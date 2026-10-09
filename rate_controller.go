@@ -35,6 +35,7 @@ const (
 type RateController struct {
 	interval  time.Duration // khoảng cách giữa hai request liên tiếp
 	targetTPS int
+	scheduled int64 // số request đã lên lịch phát (atomic counter)
 	dropped   int64 // số request bị drop do queue đầy (atomic counter)
 	issued    int64 // số request đã đẩy thành công vào queue (atomic counter)
 	totalSlip int64 // tổng độ trễ lập lịch (nanoseconds) của các request đã issued
@@ -152,6 +153,7 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 		}
 
 		scheduled++
+		atomic.AddInt64(&rc.scheduled, 1)
 
 		now := time.Now()
 		slip := now.Sub(nextDeadline)
@@ -160,6 +162,7 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 		}
 
 		// Thử đẩy request vào queue
+		req.CreatedAt = time.Now()
 		select {
 		case requests <- req:
 			atomic.AddInt64(&rc.issued, 1)
@@ -170,6 +173,10 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 			atomic.AddInt64(&rc.dropped, 1)
 		}
 	}
+}
+
+func (rc *RateController) Scheduled() int64 {
+	return atomic.LoadInt64(&rc.scheduled)
 }
 
 func (rc *RateController) Dropped() int64 {

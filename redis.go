@@ -18,16 +18,16 @@ type RedisDB struct {
 const redisIndexName = "idx_hash"
 
 func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
-	poolSize := maxConcurrency * 2
-	if poolSize < 100 {
-		poolSize = 100
+	// PoolSize trên mỗi node được set bằng maxConcurrency (tối thiểu 10)
+	// Đảm bảo không worker nào bị nghẽn do chờ connection pool,
+	// đồng thời không nhân bản connection quá mức (tránh maxConcurrency * 2).
+	poolSize := maxConcurrency
+	if poolSize < 10 {
+		poolSize = 10
 	}
 	rdb := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:    addrs,
-		PoolSize: poolSize,
-		// TỐI ƯU 1: Warm-up connection pool
-		// Nếu không có MinIdleConns, các request benchmark đầu tiên sẽ bị delay
-		// do phải liên tục thiết lập kết nối TCP (3-way handshake).
+		Addrs:        addrs,
+		PoolSize:     poolSize,
 		MinIdleConns: poolSize / 2,
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
@@ -88,6 +88,9 @@ func (r *RedisDB) Init(ctx context.Context) error {
 		if err := client.Ping(ctx).Err(); err != nil {
 			return nil // Bỏ qua node bị lỗi kết nối
 		}
+
+		// Đặt ON_TIMEOUT policy là FAIL trên server nếu hỗ trợ
+		_ = client.Do(ctx, "FT.CONFIG", "SET", "ON_TIMEOUT", "FAIL").Err()
 
 		err := client.Do(ctx, "FT.CREATE", redisIndexName, "ON", "HASH", "PREFIX", "1", "bench:key:", "SCHEMA",
 			"Dnn", "TAG",

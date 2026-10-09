@@ -274,36 +274,24 @@ func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *Workloa
 	queriesTag := make([]string, 0, queryPoolSize)
 
 	for i := 0; i < queryPoolSize; i++ {
-		pattern := queryRng.Intn(7) // 7 patterns for tag queries
+		pattern := queryRng.Intn(5) // 5 normalized cardinality patterns for tag index lookup
 		switch pattern {
 		case 0:
-			// FTEIDC exact (1000 values) + State (3 values) → ~33 records / 100K = 0.03%
-			queriesTag = append(queriesTag, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+
-				"} @State:{State_"+strconv.Itoa(queryRng.Intn(3))+"}")
+			// Point lookup: SEID (100k distinct values) -> exact 1 record match
+			queriesTag = append(queriesTag, "@SEID:{SEID_"+strconv.Itoa(queryRng.Intn(cfg.Data.KeyCount))+"}")
 		case 1:
-			// IP exact (1000 values) + SNSSAI (3 values) → ~33 records = 0.03%
-			queriesTag = append(queriesTag, "@IP:{IP_"+strconv.Itoa(queryRng.Intn(1000))+
-				"} @SNSSAI:{SNSSAI_"+strconv.Itoa(queryRng.Intn(3))+"}")
+			// High cardinality: FTEIDC (1k distinct values) -> ~100 records match (0.1% dataset)
+			queriesTag = append(queriesTag, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+"}")
 		case 2:
-			// TEIDC exact (1000 values) + IPType (2 values) → ~50 records = 0.05%
-			queriesTag = append(queriesTag, "@TEIDC:{TEIDC_"+strconv.Itoa(queryRng.Intn(1000))+
-				"} @IPType:{IPType_"+strconv.Itoa(queryRng.Intn(2))+"}")
+			// High cardinality: TEIDC (1k distinct values) -> ~100 records match (0.1% dataset)
+			queriesTag = append(queriesTag, "@TEIDC:{TEIDC_"+strconv.Itoa(queryRng.Intn(1000))+"}")
 		case 3:
-			// Dnn (100 values) + State + IPType → ~167 records = 0.17%
-			queriesTag = append(queriesTag, "@Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(100))+
-				"} @State:{State_"+strconv.Itoa(queryRng.Intn(3))+
-				"} @IPType:{IPType_"+strconv.Itoa(queryRng.Intn(2))+"}")
+			// Medium cardinality: Dnn (100 distinct values) -> ~1000 records match (1.0% dataset)
+			queriesTag = append(queriesTag, "@Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(100))+"}")
 		case 4:
-			// FTEIDC + Dnn compound → ~100/1000 * 1/100 = 0.001% ≈ 1 record
+			// Compound high/medium cardinality: FTEIDC (1k) + Dnn (100) -> ~1 record match
 			queriesTag = append(queriesTag, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+
 				"} @Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(100))+"}")
-		case 5:
-			// IP + FTEIDC compound → 1/1000 * 1/1000 ≈ 0.1 records (near-miss query)
-			queriesTag = append(queriesTag, "@IP:{IP_"+strconv.Itoa(queryRng.Intn(1000))+
-				"} @FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+"}")
-		case 6:
-			// SEID exact match → 1 record (point lookup via index)
-			queriesTag = append(queriesTag, "@SEID:{SEID_"+strconv.Itoa(queryRng.Intn(cfg.Data.KeyCount))+"}")
 		}
 	}
 

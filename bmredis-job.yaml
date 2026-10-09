@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bmredis-runner
+  namespace: hlcpc05
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: hl19f-5gc-com115
+
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      dnsConfig:
+        searches:
+          - redis-cluster-svc.hlcpc05.svc.cluster.local
+          - hlcpc05.svc.cluster.local
+
+      containers:
+        - name: benchmark
+          image: 172.20.1.22/proxy-cache/hoangmp/rdbenchmark:07104
+          imagePullPolicy: IfNotPresent
+          stdin: true
+          tty: true
+
+          args:
+            - "--config"
+            - "config.yaml"
+            - "--mode"
+            - "open-loop"
+            - "--tps"
+            - "100"
+            - "--concurrency"
+            - "50"
+            - "--set"
+            - "0"
+            - "--get"
+            - "0"
+            - "--delete"
+            - "0"
+            - "--query-tag"
+            - "100"
+            - "--query-numeric"
+            - "0"
+            - "--query-or"
+            - "0"
+            - "--query-prefix"
+            - "0"

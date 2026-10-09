@@ -5,6 +5,7 @@
 database:
   type: redis # Loại database: "redis" hoặc "aerospike" (phase 2)
 
+
 # Cấu hình Redis Cluster
 redis:
   addresses:

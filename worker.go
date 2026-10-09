@@ -123,7 +123,10 @@ func workerLoop(ctx context.Context, db Database, requests <-chan Request, resul
 // cung cấp safety net chống hang.
 func executeRequest(db Database, req Request, result *WorkerResult, trackLatency bool) {
 	ctx := context.Background()
-	start := time.Now()
+	start := req.CreatedAt
+	if start.IsZero() {
+		start = time.Now()
+	}
 	var err error
 
 	switch req.Operation {
@@ -141,12 +144,12 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 	op := int(req.Operation)
 
 	atomic.AddInt64(&result.Ops[op].Completed, 1)
+	if trackLatency {
+		result.Ops[op].Latencies = append(result.Ops[op].Latencies, latency)
+	}
 
 	if err == nil {
 		atomic.AddInt64(&result.Ops[op].Success, 1)
-		if trackLatency {
-			result.Ops[op].Latencies = append(result.Ops[op].Latencies, latency)
-		}
 		return
 	}
 
@@ -156,7 +159,10 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 		return
 	}
 
-	atomic.AddInt64(&result.Ops[op].Errors, 1)
+	errCount := atomic.AddInt64(&result.Ops[op].Errors, 1)
+	if errCount%100 == 1 {
+		log.Printf("[DB ERROR SAMPLE] %s err=%v", req.Operation, err)
+	}
 	if req.Operation >= OpQueryTag {
 		errLogger.Printf("[ERROR] %s query=%q err=%v", req.Operation, req.QueryStr, err)
 	} else {
