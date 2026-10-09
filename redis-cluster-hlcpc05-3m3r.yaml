@@ -357,6 +357,12 @@ data:
       redis-cli FT.CREATE idx:sgwc:seid       ON HASH PREFIX 1 sgwc:seid:       INDEXALL ENABLE NOOFFSETS NOFREQS NOHL SCHEMA startTime NUMERIC 2>/dev/null || true
       redis-cli FT.CREATE idx:sgwc:imsi2teid  ON HASH PREFIX 1 sgwc:imsi2teid:  INDEXALL ENABLE NOOFFSETS NOFREQS NOHL SCHEMA startTime NUMERIC 2>/dev/null || true
       redis-cli FT.CREATE idx:smf:alarm       ON HASH PREFIX 1 smf:alarm:       INDEXALL ENABLE NOOFFSETS NOFREQS NOHL SCHEMA location TAG 2>/dev/null || true
+      
+      # ---- Benchmark Index ----
+      # Index riêng dùng cho quá trình chạy benchmark (tương đương với schema trong redis.go)
+      # Bổ sung thêm NOOFFSETS NOFREQS NOHL để tối ưu memory/CPU giống với index thực tế
+      redis-cli FT.CREATE idx_hash            ON HASH PREFIX 1 bench:key:       INDEXALL ENABLE NOOFFSETS NOFREQS NOHL SCHEMA Dnn TAG IPType TAG State TAG Timer NUMERIC SEID TAG startTime NUMERIC attachTime NUMERIC FTEIDC TAG IP TAG SNSSAI TAG UpfSelection NUMERIC TEIDC TAG 2>/dev/null || true
+      
       echo "FT._LIST:"; redis-cli FT._LIST 2>/dev/null || true
     fi
 
@@ -452,8 +458,8 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
-            requests: {cpu: "1", memory: 3Gi}
-            limits:   {cpu: "1", memory: 3Gi}
+            requests: {cpu: "2", memory: 6Gi}
+            limits:   {cpu: "2", memory: 6Gi}
           volumeMounts:
             - {name: scripts, mountPath: /scripts}
             - {name: data,    mountPath: /data}
@@ -465,7 +471,7 @@ spec:
         selector:
           matchLabels: {role: master}
         resources:
-          requests: {storage: 5Gi}
+          requests: {storage: 10Gi}
 ---
 # ============================ STATEFULSET: REPLICAS =========================
 # 3 replicas, spread one-per-node (DoNotSchedule). The start.sh rotation pins
@@ -517,8 +523,8 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
-            requests: {cpu: "1", memory: 3Gi}
-            limits:   {cpu: "1", memory: 3Gi}
+            requests: {cpu: "2", memory: 6Gi}
+            limits:   {cpu: "2", memory: 6Gi}
           volumeMounts:
             - {name: scripts, mountPath: /scripts}
             - {name: data,    mountPath: /data}
@@ -530,7 +536,7 @@ spec:
         selector:
           matchLabels: {role: replica}
         resources:
-          requests: {storage: 5Gi}
+          requests: {storage: 10Gi}
 ---
 # =============================================================================
 # NOTES

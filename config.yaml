@@ -12,9 +12,9 @@ redis:
 #    - "172.16.115.27:6379"
 #    - "172.16.115.47:6379"
 #    - "172.16.115.36:6379"
-     - "redis-master-0.redis-cluster-svc.hlcpc05.svc.cluster.local:6379"
-     - "redis-master-1.redis-cluster-svc.hlcpc05.svc.cluster.local:6379"
-     - "redis-master-2.redis-cluster-svc.hlcpc05.svc.cluster.local:6379"
+     - "redis-master-0.redis-cluster.hlcpc05.svc.cluster.local:6379"
+     - "redis-master-1.redis-cluster.hlcpc05.svc.cluster.local:6379"
+     - "redis-master-2.redis-cluster.hlcpc05.svc.cluster.local:6379"
     # - redis-cluster.hlcpc05.svc.cluster.local:6379
 
 # Cấu hình Aerospike

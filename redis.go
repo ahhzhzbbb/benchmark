@@ -92,7 +92,8 @@ func (r *RedisDB) Init(ctx context.Context) error {
 		// Đặt ON_TIMEOUT policy là FAIL trên server nếu hỗ trợ
 		_ = client.Do(ctx, "FT.CONFIG", "SET", "ON_TIMEOUT", "FAIL").Err()
 
-		err := client.Do(ctx, "FT.CREATE", redisIndexName, "ON", "HASH", "PREFIX", "1", "bench:key:", "SCHEMA",
+		err := client.Do(ctx, "FT.CREATE", redisIndexName, "ON", "HASH", "PREFIX", "1", "bench:key:",
+			"NOOFFSETS", "NOFREQS", "NOHL", "SCHEMA",
 			"Dnn", "TAG",
 			"IPType", "TAG",
 			"State", "TAG",
