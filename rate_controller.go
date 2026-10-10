@@ -131,7 +131,12 @@ func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<
 			default:
 			}
 		} else {
-			// Đã quá deadline (đang bị trễ), kiểm tra ctx trước khi tiếp tục
+			// Đã quá deadline (đang bị trễ).
+			// Cho phép vòng lặp chạy ngay lập tức để bắt kịp (catch-up) mục tiêu TPS.
+			// Các micro-delays của OS scheduler sẽ không bị tích luỹ làm giảm TPS.
+			// Nếu bị trễ quá lâu, nó sẽ burst một lượng request vào queue.
+			// Nếu queue đầy, nó sẽ rơi vào case default và ghi nhận là Dropped.
+
 			select {
 			case <-ctx.Done():
 				return rc.Issued()

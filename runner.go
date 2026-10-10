@@ -336,6 +336,7 @@ func (r *Runner) runOpenLoop(ctx context.Context) {
 
 	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastScheduled int64
 	startTime := time.Now()
+	lastTick := startTime
 
 	fmt.Println("\n--- Open-Loop Mode ---")
 	fmt.Printf("Target TPS:     %d\n", r.cfg.Load.TargetTPS)
@@ -370,11 +371,18 @@ reporterLoop:
 				inFlight = 0
 			}
 
-			schedTPS := currentScheduled - lastScheduled
-			sentTPS := currentIssued - lastIssued
-			lastCompleted := lastSuccess + lastNotFound + lastErrors
-			ackTPS := currentCompleted - lastCompleted
-			errorTPS := currentErrors - lastErrors
+			now := time.Now()
+			deltaSec := now.Sub(lastTick).Seconds()
+			lastTick = now
+
+			var schedTPS, sentTPS, ackTPS, errorTPS int64
+			if deltaSec > 0 {
+				schedTPS = int64(float64(currentScheduled-lastScheduled) / deltaSec)
+				sentTPS = int64(float64(currentIssued-lastIssued) / deltaSec)
+				lastCompleted := lastSuccess + lastNotFound + lastErrors
+				ackTPS = int64(float64(currentCompleted-lastCompleted) / deltaSec)
+				errorTPS = int64(float64(currentErrors-lastErrors) / deltaSec)
+			}
 
 			errorRate := 0.0
 			if ackTPS > 0 {
