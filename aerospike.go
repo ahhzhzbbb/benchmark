@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -11,13 +11,6 @@ import (
 	as "github.com/aerospike/aerospike-client-go/v7"
 	astypes "github.com/aerospike/aerospike-client-go/v7/types"
 )
-
-// tagRegex: @field:{value} (loại trừ value chứa '*' — đó là prefix query).
-var tagRegex = regexp.MustCompile(`@(\w+):\{([^}*]+)\}`)
-var numRegex = regexp.MustCompile(`@(\w+):\[(\d+)\s+(\d+)\]`)
-
-// prefixRegex: @field:{prefix*} (cú pháp prefix trên TAG field của RediSearch).
-var prefixRegex = regexp.MustCompile(`@(\w+):\{([^}*]+)\*\}`)
 
 // defaultAerospikeTimeout khớp với ReadTimeout/WriteTimeout của Redis adapter.
 const defaultAerospikeTimeout = 3 * time.Second
@@ -72,30 +65,48 @@ func NewAerospikeDB(cfg AerospikeCfg) (*AerospikeDB, error) {
 		timeout = defaultAerospikeTimeout
 	}
 
+	// ClientPolicy PHẢI được cấu hình trước khi tạo client; set sau sẽ không có tác dụng.
 	clientPolicy := as.NewClientPolicy()
 	clientPolicy.Timeout = 5 * time.Second // giống DialTimeout của Redis adapter
+	// Tắt circuit breaker phía client (MAX_ERROR_RATE): benchmark cần thấy lỗi thật của server.
+	clientPolicy.MaxErrorRate = 0
+	// Tăng ConnectionQueueSize và cho phép mở thêm kết nối nếu cần để không bao giờ bị nghẽn do cạn pool
+	clientPolicy.ConnectionQueueSize = 4096
+	clientPolicy.LimitConnectionsToQueueSize = false
+	clientPolicy.OpeningConnectionThreshold = 0
+	clientPolicy.IdleTimeout = 55 * time.Second
 	client, err := as.NewClientWithPolicyAndHost(clientPolicy, hosts...)
 	if err != nil {
 		return nil, err
 	}
 
+	// MaxRetries=0: không retry để latency/lỗi phản ánh đúng 1 lần gọi (giống Redis adapter).
 	readPolicy := as.NewPolicy()
 	readPolicy.TotalTimeout = timeout
 	readPolicy.SocketTimeout = timeout
+	readPolicy.MaxRetries = 0
 
 	writePolicy := as.NewWritePolicy(0, 0)
 	writePolicy.TotalTimeout = timeout
 	writePolicy.SocketTimeout = timeout
+	writePolicy.MaxRetries = 0
 
 	// Query policy tương đương FT.SEARCH ... TIMEOUT 2000 NOCONTENT LIMIT 0 10:
 	//   - IncludeBinData=false: chỉ trả về key/digest, giống NOCONTENT của Redis
-	//   - MaxRecords: giới hạn phía server, giống LIMIT của Redis
+	//   - MaxRecords=queryResultLimit: server dừng ngay sau khi lấy đủ số bản ghi (gửi _INFO3_LAST)
+	//   - ExpectedDuration=SHORT / ShortQuery=true: báo cho Aerospike Server chạy query inline trực tiếp
+	//     trên service thread (giống GET), bỏ qua query monitor và query thread pool overhead
+	//   - RecordQueueSize: buffer cho channel kết quả để worker không bị nghẽn khi nhận stream
 	queryTimeout := time.Duration(queryTimeoutMs) * time.Millisecond
 	queryPolicy := as.NewQueryPolicy()
 	queryPolicy.TotalTimeout = queryTimeout
 	queryPolicy.SocketTimeout = queryTimeout
 	queryPolicy.IncludeBinData = false
 	queryPolicy.MaxRecords = queryResultLimit
+	queryPolicy.ExpectedDuration = as.SHORT
+	queryPolicy.ShortQuery = true
+	queryPolicy.MaxRetries = 0
+	queryPolicy.RecordQueueSize = 512
 
 	return &AerospikeDB{
 		client:      client,
@@ -253,117 +264,53 @@ func (a *AerospikeDB) Delete(ctx context.Context, keyStr string) error {
 	return nil
 }
 
-// parseQueryExpr parse chuỗi query RediSearch (TAG, NUMERIC, OR, PREFIX) sang Aerospike Filter và FilterExpression.
-//
-// OR query: Aerospike chỉ dùng được tối đa 1 Secondary Index/query nên không thể
-// phục vụ nhiều nhánh bằng SI → mọi điều kiện của mọi nhánh đều chuyển thành
-// expression, gộp bằng ExpOr, và query chạy dạng set scan.
-func parseQueryExpr(query string) (*as.Filter, *as.Expression) {
-	if strings.Contains(query, "|") {
-		var branchExps []*as.Expression
-		for _, part := range strings.Split(query, "|") {
-			if _, exp := parseSingleExpr(part, false); exp != nil {
-				branchExps = append(branchExps, exp)
-			}
-		}
-		switch len(branchExps) {
-		case 0:
-			return nil, nil
-		case 1:
-			return nil, branchExps[0]
-		default:
-			return nil, as.ExpOr(branchExps...)
-		}
-	}
-	return parseSingleExpr(query, true)
-}
-
-// parseSingleExpr parse một nhánh AND. useSI=true: điều kiện TAG/NUMERIC đầu tiên
-// dùng Secondary Index, phần còn lại là expression. useSI=false: tất cả là expression.
-func parseSingleExpr(query string, useSI bool) (*as.Filter, *as.Expression) {
-	tags := tagRegex.FindAllStringSubmatch(query, -1)
-	nums := numRegex.FindAllStringSubmatch(query, -1)
-	prefixes := prefixRegex.FindAllStringSubmatch(query, -1)
-
-	var exps []*as.Expression
-	var siFilter *as.Filter
-
-	for _, match := range tags {
-		bin := match[1]
-		val := match[2]
-		if useSI && siFilter == nil {
-			siFilter = as.NewEqualFilter(bin, val)
-		} else {
-			exps = append(exps, as.ExpEq(as.ExpStringBin(bin), as.ExpStringVal(val)))
-		}
-	}
-	for _, match := range nums {
-		bin := match[1]
-		min, _ := strconv.ParseInt(match[2], 10, 64)
-		max, _ := strconv.ParseInt(match[3], 10, 64)
-		if useSI && siFilter == nil {
-			siFilter = as.NewRangeFilter(bin, min, max)
-		} else {
-			exps = append(exps, as.ExpGreaterEq(as.ExpIntBin(bin), as.ExpIntVal(min)))
-			exps = append(exps, as.ExpLessEq(as.ExpIntBin(bin), as.ExpIntVal(max)))
-		}
-	}
-	for _, match := range prefixes {
-		bin := match[1]
-		prefix := regexp.QuoteMeta(match[2])
-		exps = append(exps, as.ExpRegexCompare("^"+prefix, 0, as.ExpStringBin(bin)))
+// Query thực thi truy vấn Secondary Index trên Aerospike dựa trên cấu trúc QuerySpec.
+// Hoạt động độc lập, gọi trực tiếp API native của Aerospike SDK mà không cần parse chuỗi hay regex.
+func (a *AerospikeDB) Query(ctx context.Context, query *QuerySpec) error {
+	if query == nil {
+		return errors.New("nil query spec")
 	}
 
-	var finalExp *as.Expression
-	if len(exps) == 1 {
-		finalExp = exps[0]
-	} else if len(exps) > 1 {
-		finalExp = as.ExpAnd(exps...)
-	}
-
-	return siFilter, finalExp
-}
-
-func (a *AerospikeDB) Query(ctx context.Context, query string) error {
 	timeout, err := ctxTimeout(ctx, a.queryPolicy.TotalTimeout)
 	if err != nil {
 		return err
 	}
 
 	stmt := as.NewStatement(a.namespace, a.setName)
-	siFilter, filterExp := parseQueryExpr(query)
-
-	if siFilter != nil {
-		stmt.SetFilter(siFilter)
+	if !query.IsRange {
+		stmt.SetFilter(as.NewEqualFilter(query.Bin, query.Value))
+	} else {
+		stmt.SetFilter(as.NewRangeFilter(query.Bin, query.Min, query.Max))
 	}
 
-	// Copy policy dùng chung để gắn FilterExpression/timeout riêng cho query này.
+	// Copy policy dùng chung để gắn timeout riêng cho query này (an toàn đa luồng).
 	policy := *a.queryPolicy
 	policy.TotalTimeout, policy.SocketTimeout = timeout, timeout
-	policy.FilterExpression = filterExp
 
 	rs, qerr := a.client.Query(&policy, stmt)
 	if qerr != nil {
 		return qerr
 	}
-	defer rs.Close()
 
+	// Đọc hết toàn bộ channel kết quả mà server gửi để socket kết thúc tự nhiên (_INFO3_LAST),
+	// giúp kết nối TCP được trả về connection pool một cách nguyên vẹn (KeepConnection = true).
+	// KHÔNG gọi rs.Close() giữa chừng khi đạt limit, vì việc hủy ngang luồng đọc sẽ làm
+	// SDK trả về lỗi QUERY_TERMINATED và ĐÓNG/TIÊU HỦY toàn bộ socket TCP tới các node (KeepConnection = false),
+	// gây ra hiện tượng bão mở/đóng kết nối (connection storm) làm sụp đổ TPS trong open-loop mode.
+	// rs.Close() chỉ được gọi khi ctx bị timeout hoặc bị hủy.
+	var queryErr error
 	results := rs.Results()
-	count := 0
 	for {
 		select {
 		case <-ctx.Done():
+			rs.Close()
 			return ctx.Err()
 		case res, ok := <-results:
 			if !ok {
-				return nil
+				return queryErr
 			}
-			if res.Err != nil {
-				return res.Err
-			}
-			count++
-			if count >= queryResultLimit {
-				return nil
+			if res.Err != nil && queryErr == nil {
+				queryErr = res.Err
 			}
 		}
 	}

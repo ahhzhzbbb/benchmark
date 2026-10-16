@@ -233,22 +233,18 @@ func makePayload(rec Record, dbType string) *Payload {
 // KHÔNG thread-safe. Chỉ được gọi từ một goroutine duy nhất
 // (trong thiết kế này là goroutine pre-generate của RateController).
 type WorkloadGenerator struct {
-	rng              *rand.Rand // chọn loại thao tác, key, query
-	updateRng        *rand.Rand // sinh nội dung record cho SET
-	keys             *KeySpace
-	payloadSize      int
-	dbType           string
-	queriesTag       []string // pre-defined query tag patterns
-	queriesNumeric   []string // pre-defined query numeric patterns
-	queriesOr        []string // pre-defined query OR patterns
-	queriesPrefix    []string // pre-defined query prefix patterns
-	getRatio         float64  // tỉ lệ tích luỹ: [0, getRatio) → GET
-	setRatio         float64  // tỉ lệ tích luỹ: [getRatio, setRatio) → SET
-	delRatio         float64  // tỉ lệ tích luỹ: [setRatio, delRatio) → DELETE
-	queryTagRatio    float64  // tỉ lệ tích luỹ: [delRatio, queryTagRatio) → QUERY_TAG
-	queryNumRatio    float64  // tỉ lệ tích luỹ: [queryTagRatio, queryNumRatio) → QUERY_NUMERIC
-	queryOrRatio     float64  // tỉ lệ tích luỹ: [queryNumRatio, queryOrRatio) → QUERY_OR
-	queryPrefixRatio float64  // tỉ lệ tích luỹ: [queryOrRatio, 1.0) → QUERY_PREFIX
+	rng            *rand.Rand // chọn loại thao tác, key, query
+	updateRng      *rand.Rand // sinh nội dung record cho SET
+	keys           *KeySpace
+	payloadSize    int
+	dbType         string
+	queriesTag     []*QuerySpec // pre-defined query tag patterns
+	queriesNumeric []*QuerySpec // pre-defined query numeric patterns
+	getRatio       float64      // tỉ lệ tích luỹ: [0, getRatio) → GET
+	setRatio       float64      // tỉ lệ tích luỹ: [getRatio, setRatio) → SET
+	delRatio       float64      // tỉ lệ tích luỹ: [setRatio, delRatio) → DELETE
+	queryTagRatio  float64      // tỉ lệ tích luỹ: [delRatio, queryTagRatio) → QUERY_TAG
+	// [queryTagRatio, 1.0) → QUERY_NUMERIC
 }
 
 // NewWorkloadGenerator khởi tạo generator từ config.
@@ -257,7 +253,7 @@ type WorkloadGenerator struct {
 //     nhau để không lặp lại cùng một chuỗi request.
 //   - keys: trạng thái key dùng chung giữa các phase.
 func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *WorkloadGenerator {
-	total := float64(cfg.Workload.Get + cfg.Workload.Set + cfg.Workload.Delete + cfg.Workload.QueryTag + cfg.Workload.QueryNumeric + cfg.Workload.QueryOr + cfg.Workload.QueryPrefix)
+	total := float64(cfg.Workload.Get + cfg.Workload.Set + cfg.Workload.Delete + cfg.Workload.QueryTag + cfg.Workload.QueryNumeric)
 	if total == 0 {
 		total = 1 // tránh chia cho 0
 	}
@@ -265,108 +261,74 @@ func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *Workloa
 	setRatio := getRatio + float64(cfg.Workload.Set)/total
 	delRatio := setRatio + float64(cfg.Workload.Delete)/total
 	queryTagRatio := delRatio + float64(cfg.Workload.QueryTag)/total
-	queryNumRatio := queryTagRatio + float64(cfg.Workload.QueryNumeric)/total
-	queryOrRatio := queryNumRatio + float64(cfg.Workload.QueryOr)/total
-	queryPrefixRatio := 1.0
 
 	queryPoolSize := 200
 	queryRng := rand.New(rand.NewSource(streamSeed + 2))
-	queriesTag := make([]string, 0, queryPoolSize)
+	queriesTag := make([]*QuerySpec, 0, queryPoolSize)
 
 	for i := 0; i < queryPoolSize; i++ {
-		pattern := queryRng.Intn(5) // 5 normalized cardinality patterns for tag index lookup
-		switch pattern {
-		case 0:
-			// Point lookup: SEID (100k distinct values) -> exact 1 record match
-			queriesTag = append(queriesTag, "@SEID:{SEID_"+strconv.Itoa(queryRng.Intn(cfg.Data.KeyCount))+"}")
-		case 1:
-			// High cardinality: FTEIDC (1k distinct values) -> ~100 records match (0.1% dataset)
-			queriesTag = append(queriesTag, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+"}")
-		case 2:
-			// High cardinality: TEIDC (1k distinct values) -> ~100 records match (0.1% dataset)
-			queriesTag = append(queriesTag, "@TEIDC:{TEIDC_"+strconv.Itoa(queryRng.Intn(1000))+"}")
-		case 3:
-			// Medium cardinality: Dnn (100 distinct values) -> ~1000 records match (1.0% dataset)
-			queriesTag = append(queriesTag, "@Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(100))+"}")
-		case 4:
-			// Compound high/medium cardinality: FTEIDC (1k) + Dnn (100) -> ~1 record match
-			queriesTag = append(queriesTag, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(1000))+
-				"} @Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(100))+"}")
-		}
+		// Single-field tag query: Dnn (100 distinct values: Dnn_0 .. Dnn_99) -> ~1% dataset match
+		val := "Dnn_" + strconv.Itoa(queryRng.Intn(100))
+		queriesTag = append(queriesTag, &QuerySpec{
+			Bin:      "Dnn",
+			IsRange:  false,
+			Value:    val,
+			RedisRaw: "@Dnn:{" + val + "}",
+		})
 	}
 
-	queriesNumeric := make([]string, 0, queryPoolSize)
+	queriesNumeric := make([]*QuerySpec, 0, queryPoolSize)
 	for i := 0; i < queryPoolSize; i++ {
 		pattern := queryRng.Intn(3)
 		switch pattern {
 		case 0:
 			// Timer range (width 10)
-			tStart := queryRng.Intn(90)
-			queriesNumeric = append(queriesNumeric, "@Timer:["+strconv.Itoa(tStart)+" "+strconv.Itoa(tStart+10)+"]")
+			tStart := int64(queryRng.Intn(90))
+			tEnd := tStart + 10
+			queriesNumeric = append(queriesNumeric, &QuerySpec{
+				Bin:      "Timer",
+				IsRange:  true,
+				Min:      tStart,
+				Max:      tEnd,
+				RedisRaw: "@Timer:[" + strconv.FormatInt(tStart, 10) + " " + strconv.FormatInt(tEnd, 10) + "]",
+			})
 		case 1:
 			// startTime range (width 5000)
-			sStart := 1700000000 + queryRng.Intn(9995000)
-			queriesNumeric = append(queriesNumeric, "@startTime:["+strconv.Itoa(sStart)+" "+strconv.Itoa(sStart+5000)+"]")
+			sStart := int64(1700000000 + queryRng.Intn(9995000))
+			sEnd := sStart + 5000
+			queriesNumeric = append(queriesNumeric, &QuerySpec{
+				Bin:      "startTime",
+				IsRange:  true,
+				Min:      sStart,
+				Max:      sEnd,
+				RedisRaw: "@startTime:[" + strconv.FormatInt(sStart, 10) + " " + strconv.FormatInt(sEnd, 10) + "]",
+			})
 		case 2:
 			// UpfSelection range (width 10000)
-			uStart := queryRng.Intn(1999900000)
-			queriesNumeric = append(queriesNumeric, "@UpfSelection:["+strconv.Itoa(uStart)+" "+strconv.Itoa(uStart+10000)+"]")
-		}
-	}
-
-	queriesOr := make([]string, 0, queryPoolSize)
-	for i := 0; i < queryPoolSize; i++ {
-		pattern := queryRng.Intn(3)
-		switch pattern {
-		case 0:
-			// OR between two State & Timer ranges
-			queriesOr = append(queriesOr, "(@State:{State_0} @Timer:[0 30]) | (@State:{State_2} @Timer:[70 100])")
-		case 1:
-			// OR between two FTEID values
-			f1 := queryRng.Intn(1000)
-			f2 := queryRng.Intn(1000)
-			queriesOr = append(queriesOr, "(@FTEIDC:{FTEIDC_"+strconv.Itoa(f1)+"}) | (@FTEIDC:{FTEIDC_"+strconv.Itoa(f2)+"})")
-		case 2:
-			// OR between two Dnn values
-			d1 := queryRng.Intn(100)
-			d2 := queryRng.Intn(100)
-			queriesOr = append(queriesOr, "(@Dnn:{Dnn_"+strconv.Itoa(d1)+"}) | (@Dnn:{Dnn_"+strconv.Itoa(d2)+"})")
-		}
-	}
-
-	queriesPrefix := make([]string, 0, queryPoolSize)
-	for i := 0; i < queryPoolSize; i++ {
-		pattern := queryRng.Intn(4)
-		switch pattern {
-		// Prefix trên TAG field phải dùng cú pháp @field:{prefix*}
-		case 0:
-			queriesPrefix = append(queriesPrefix, "@Dnn:{Dnn_"+strconv.Itoa(queryRng.Intn(10))+"*}")
-		case 1:
-			queriesPrefix = append(queriesPrefix, "@FTEIDC:{FTEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*}")
-		case 2:
-			queriesPrefix = append(queriesPrefix, "@TEIDC:{TEIDC_"+strconv.Itoa(queryRng.Intn(10))+"*}")
-		case 3:
-			queriesPrefix = append(queriesPrefix, "@IP:{IP_"+strconv.Itoa(queryRng.Intn(10))+"*}")
+			uStart := int64(queryRng.Intn(1999900000))
+			uEnd := uStart + 10000
+			queriesNumeric = append(queriesNumeric, &QuerySpec{
+				Bin:      "UpfSelection",
+				IsRange:  true,
+				Min:      uStart,
+				Max:      uEnd,
+				RedisRaw: "@UpfSelection:[" + strconv.FormatInt(uStart, 10) + " " + strconv.FormatInt(uEnd, 10) + "]",
+			})
 		}
 	}
 
 	return &WorkloadGenerator{
-		rng:              rand.New(rand.NewSource(streamSeed)),
-		updateRng:        rand.New(rand.NewSource(streamSeed + 1)),
-		keys:             keys,
-		payloadSize:      cfg.Data.PayloadSize,
-		dbType:           cfg.Database.Type,
-		queriesTag:       queriesTag,
-		queriesNumeric:   queriesNumeric,
-		queriesOr:        queriesOr,
-		queriesPrefix:    queriesPrefix,
-		getRatio:         getRatio,
-		setRatio:         setRatio,
-		delRatio:         delRatio,
-		queryTagRatio:    queryTagRatio,
-		queryNumRatio:    queryNumRatio,
-		queryOrRatio:     queryOrRatio,
-		queryPrefixRatio: queryPrefixRatio,
+		rng:            rand.New(rand.NewSource(streamSeed)),
+		updateRng:      rand.New(rand.NewSource(streamSeed + 1)),
+		keys:           keys,
+		payloadSize:    cfg.Data.PayloadSize,
+		dbType:         cfg.Database.Type,
+		queriesTag:     queriesTag,
+		queriesNumeric: queriesNumeric,
+		getRatio:       getRatio,
+		setRatio:       setRatio,
+		delRatio:       delRatio,
+		queryTagRatio:  queryTagRatio,
 	}
 }
 
@@ -402,25 +364,13 @@ func (w *WorkloadGenerator) Next() (Request, bool) {
 	case r < w.queryTagRatio:
 		return Request{
 			Operation: OpQueryTag,
-			QueryStr:  w.queriesTag[w.rng.Intn(len(w.queriesTag))],
-		}, true
-
-	case r < w.queryNumRatio:
-		return Request{
-			Operation: OpQueryNumeric,
-			QueryStr:  w.queriesNumeric[w.rng.Intn(len(w.queriesNumeric))],
-		}, true
-
-	case r < w.queryOrRatio:
-		return Request{
-			Operation: OpQueryOr,
-			QueryStr:  w.queriesOr[w.rng.Intn(len(w.queriesOr))],
+			Query:     w.queriesTag[w.rng.Intn(len(w.queriesTag))],
 		}, true
 
 	default:
 		return Request{
-			Operation: OpQueryPrefix,
-			QueryStr:  w.queriesPrefix[w.rng.Intn(len(w.queriesPrefix))],
+			Operation: OpQueryNumeric,
+			Query:     w.queriesNumeric[w.rng.Intn(len(w.queriesNumeric))],
 		}, true
 	}
 }

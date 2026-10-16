@@ -33,7 +33,7 @@ type OpMetrics struct {
 // WorkerResult chứa kết quả thu thập từ một worker trong suốt quá trình benchmark.
 // Mỗi worker có WorkerResult riêng, không chia sẻ → không cần lock/mutex.
 type WorkerResult struct {
-	Ops [7]OpMetrics // 0: GET, 1: SET, 2: DELETE, 3: QUERY_TAG, 4: QUERY_NUMERIC, 5: QUERY_OR, 6: QUERY_PREFIX
+	Ops [5]OpMetrics // 0: GET, 1: SET, 2: DELETE, 3: QUERY_TAG, 4: QUERY_NUMERIC
 }
 
 // WorkerPool quản lý một nhóm worker goroutine.
@@ -65,7 +65,7 @@ func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackL
 	for i := 0; i < wp.concurrency; i++ {
 		wg.Add(1)
 		res := &WorkerResult{}
-		for j := 0; j < 7; j++ {
+		for j := 0; j < len(res.Ops); j++ {
 			// Pre-allocate slice latency để giảm re-allocation khi benchmark đang chạy
 			if trackLatency {
 				res.Ops[j].Latencies = make([]time.Duration, 0, 256)
@@ -136,8 +136,8 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 		err = db.Set(ctx, req.Key, req.Payload)
 	case OpDelete:
 		err = db.Delete(ctx, req.Key)
-	case OpQueryTag, OpQueryNumeric, OpQueryOr, OpQueryPrefix:
-		err = db.Query(ctx, req.QueryStr)
+	case OpQueryTag, OpQueryNumeric:
+		err = db.Query(ctx, req.Query)
 	}
 
 	latency := time.Since(start)
@@ -164,7 +164,7 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 		log.Printf("[DB ERROR SAMPLE] %s err=%v", req.Operation, err)
 	}
 	if req.Operation >= OpQueryTag {
-		errLogger.Printf("[ERROR] %s query=%q err=%v", req.Operation, req.QueryStr, err)
+		errLogger.Printf("[ERROR] %s query=%v err=%v", req.Operation, req.Query, err)
 	} else {
 		errLogger.Printf("[ERROR] %s key=%q err=%v", req.Operation, req.Key, err)
 	}

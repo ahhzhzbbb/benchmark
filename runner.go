@@ -263,16 +263,14 @@ func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 
 // printConfig in tóm tắt cấu hình benchmark ra stdout.
 func (r *Runner) printConfig() {
-	total := r.cfg.Workload.Get + r.cfg.Workload.Set + r.cfg.Workload.Delete + r.cfg.Workload.QueryTag + r.cfg.Workload.QueryNumeric + r.cfg.Workload.QueryOr + r.cfg.Workload.QueryPrefix
-	getPct, setPct, delPct, qtPct, qnPct, qoPct, qpPct := 0, 0, 0, 0, 0, 0, 0
+	total := r.cfg.Workload.Get + r.cfg.Workload.Set + r.cfg.Workload.Delete + r.cfg.Workload.QueryTag + r.cfg.Workload.QueryNumeric
+	getPct, setPct, delPct, qtPct, qnPct := 0, 0, 0, 0, 0
 	if total > 0 {
 		getPct = r.cfg.Workload.Get * 100 / total
 		setPct = r.cfg.Workload.Set * 100 / total
 		delPct = r.cfg.Workload.Delete * 100 / total
 		qtPct = r.cfg.Workload.QueryTag * 100 / total
-		qnPct = r.cfg.Workload.QueryNumeric * 100 / total
-		qoPct = r.cfg.Workload.QueryOr * 100 / total
-		qpPct = 100 - getPct - setPct - delPct - qtPct - qnPct - qoPct
+		qnPct = 100 - getPct - setPct - delPct - qtPct
 	}
 
 	fmt.Println()
@@ -285,7 +283,7 @@ func (r *Runner) printConfig() {
 	fmt.Printf("  Key Count:      %d\n", r.cfg.Data.KeyCount)
 	fmt.Printf("  Payload Size:   %d bytes\n", r.cfg.Data.PayloadSize)
 	fmt.Printf("  Seed:           %d\n", r.cfg.Data.Seed)
-	fmt.Printf("  Workload:       GET=%d%% SET=%d%% DELETE=%d%% QUERY_TAG=%d%% QUERY_NUMERIC=%d%% QUERY_OR=%d%% QUERY_PREFIX=%d%%\n", getPct, setPct, delPct, qtPct, qnPct, qoPct, qpPct)
+	fmt.Printf("  Workload:       GET=%d%% SET=%d%% DELETE=%d%% QUERY_TAG=%d%% QUERY_NUMERIC=%d%%\n", getPct, setPct, delPct, qtPct, qnPct)
 	fmt.Printf("  Warmup:         %v\n", r.cfg.Warmup.Duration.Duration)
 	fmt.Printf("  Benchmark:      %v\n", r.cfg.Benchmark.Duration.Duration)
 	fmt.Printf("  Grace Period:   %v\n", r.cfg.Shutdown.GracePeriod.Duration)
@@ -354,7 +352,7 @@ reporterLoop:
 
 			// Tổng hợp từ các worker
 			for _, res := range results {
-				for i := 0; i < 7; i++ {
+				for i := 0; i < len(res.Ops); i++ {
 					currentSuccess += atomic.LoadInt64(&res.Ops[i].Success)
 					currentNotFound += atomic.LoadInt64(&res.Ops[i].NotFound)
 					currentErrors += atomic.LoadInt64(&res.Ops[i].Errors)

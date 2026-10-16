@@ -65,8 +65,6 @@ type WorkloadCfg struct {
 	Delete       int `yaml:"delete"`
 	QueryTag     int `yaml:"query_tag"`
 	QueryNumeric int `yaml:"query_numeric"`
-	QueryOr      int `yaml:"query_or"`
-	QueryPrefix  int `yaml:"query_prefix"`
 }
 
 // PhaseCfg cấu hình thời gian cho warmup hoặc measurement phase.
@@ -112,8 +110,6 @@ func LoadConfig() (Config, error) {
 	deleteOverride := flag.Int("delete", -1, "Override DELETE workload ratio (-1 to use config file value)")
 	queryTagOverride := flag.Int("query-tag", -1, "Override QUERY_TAG workload ratio (-1 to use config file value)")
 	queryNumericOverride := flag.Int("query-numeric", -1, "Override QUERY_NUMERIC workload ratio (-1 to use config file value)")
-	queryOrOverride := flag.Int("query-or", -1, "Override QUERY_OR workload ratio (-1 to use config file value)")
-	queryPrefixOverride := flag.Int("query-prefix", -1, "Override QUERY_PREFIX workload ratio (-1 to use config file value)")
 	keyCountOverride := flag.Int("key-count", 0, "Override number of records/keys to load (0 to use config file value)")
 	flag.Parse()
 
@@ -158,12 +154,6 @@ func LoadConfig() (Config, error) {
 	}
 	if *queryNumericOverride >= 0 {
 		cfg.Workload.QueryNumeric = *queryNumericOverride
-	}
-	if *queryOrOverride >= 0 {
-		cfg.Workload.QueryOr = *queryOrOverride
-	}
-	if *queryPrefixOverride >= 0 {
-		cfg.Workload.QueryPrefix = *queryPrefixOverride
 	}
 
 	if *keyCountOverride > 0 {
@@ -222,8 +212,6 @@ func defaultConfig() Config {
 			Delete:       15,
 			QueryTag:     10,
 			QueryNumeric: 5,
-			QueryOr:      10,
-			QueryPrefix:  5,
 		},
 		Warmup:    PhaseCfg{Duration: Duration{5 * time.Second}},
 		Benchmark: PhaseCfg{Duration: Duration{10 * time.Second}},

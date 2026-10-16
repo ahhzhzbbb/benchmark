@@ -249,7 +249,11 @@ func TestWarmupStreamDiffersFromMeasurement(t *testing.T) {
 		out := make([]string, 200)
 		for i := range out {
 			req, _ := gen.Next()
-			out[i] = req.Operation.String() + req.Key + req.QueryStr
+			qStr := ""
+			if req.Query != nil {
+				qStr = req.Query.String()
+			}
+			out[i] = req.Operation.String() + req.Key + qStr
 		}
 		return out
 	}
@@ -301,21 +305,49 @@ func TestParseAerospikeHost(t *testing.T) {
 	}
 }
 
-// TestParseQueryExpr kiểm tra việc dịch cú pháp RediSearch sang Aerospike.
-func TestParseQueryExpr(t *testing.T) {
-	// AND thường: điều kiện đầu dùng SI, điều kiện sau là expression.
-	if f, e := parseQueryExpr("@FTEIDC:{FTEIDC_1} @State:{State_2}"); f == nil || e == nil {
-		t.Errorf("AND query: want filter+expr, got %v, %v", f, e)
+// TestQuerySpecFormat kiểm tra việc khởi tạo QuerySpec cho TAG và NUMERIC queries.
+func TestQuerySpecFormat(t *testing.T) {
+	tagSpec := &QuerySpec{
+		Bin:      "Dnn",
+		IsRange:  false,
+		Value:    "Dnn_10",
+		RedisRaw: "@Dnn:{Dnn_10}",
 	}
-	// OR mà mỗi nhánh chỉ có 1 TAG: cả hai nhánh phải thành expression, không dùng SI.
-	if f, e := parseQueryExpr("(@FTEIDC:{FTEIDC_1}) | (@FTEIDC:{FTEIDC_2})"); f != nil || e == nil {
-		t.Errorf("OR query: want no filter + expr, got %v, %v", f, e)
+	if tagSpec.IsRange || tagSpec.Bin != "Dnn" || tagSpec.Value != "Dnn_10" {
+		t.Errorf("unexpected tagSpec: %v", tagSpec)
 	}
-	// Prefix trên TAG: không được bị nhận nhầm thành equality filter.
-	if tagRegex.MatchString("@Dnn:{Dnn_9*}") {
-		t.Error("tagRegex must not match prefix query")
+
+	numSpec := &QuerySpec{
+		Bin:      "Timer",
+		IsRange:  true,
+		Min:      10,
+		Max:      20,
+		RedisRaw: "@Timer:[10 20]",
 	}
-	if f, e := parseQueryExpr("@Dnn:{Dnn_9*}"); f != nil || e == nil {
-		t.Errorf("prefix query: want no filter + expr, got %v, %v", f, e)
+	if !numSpec.IsRange || numSpec.Bin != "Timer" || numSpec.Min != 10 || numSpec.Max != 20 {
+		t.Errorf("unexpected numSpec: %v", numSpec)
 	}
 }
+
+// TestQueriesTagSingleFieldDnn kiểm tra tất cả các tag query đều chỉ lọc trên trường Dnn.
+func TestQueriesTagSingleFieldDnn(t *testing.T) {
+	cfg := runWorkloadCfg(0, 0, 0, 100, 0)
+	gen := NewWorkloadGenerator(cfg, 12345, NewKeySpace(cfg.Data.KeyCount))
+
+	for i := 0; i < 500; i++ {
+		req, ok := gen.Next()
+		if !ok {
+			t.Fatal("expected request")
+		}
+		if req.Operation != OpQueryTag {
+			t.Fatalf("expected OpQueryTag, got %v", req.Operation)
+		}
+		if req.Query == nil || !strings.HasPrefix(req.Query.RedisRaw, "@Dnn:{Dnn_") || !strings.HasSuffix(req.Query.RedisRaw, "}") {
+			t.Fatalf("unexpected query format: %v", req.Query)
+		}
+		if req.Query.Bin != "Dnn" || req.Query.IsRange {
+			t.Fatalf("expected non-range Dnn query, got %v", req.Query)
+		}
+	}
+}
+

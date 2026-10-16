@@ -116,7 +116,7 @@ docker build -t benchmarkdb:latest .
 ./benchmarkDB --config config.yaml
 
 # Bạn có thể ghi đè (override) cấu hình trực tiếp từ CLI flags:
-./benchmarkDB --config config.yaml --tps 50000 --concurrency 200 --get 40 --set 20 --delete 10 --query-tag 10 --query-numeric 5 --query-or 10 --query-prefix 5
+./benchmarkDB --config config.yaml --tps 50000 --concurrency 200 --get 40 --set 20 --delete 10 --query-tag 20 --query-numeric 10
 ```
 
 ## 7. Cấu hình (Configuration)

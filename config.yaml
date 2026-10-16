@@ -3,7 +3,7 @@
 # Chạy: ./benchmarkDB --config config.yaml
 
 database:
-  type: redis # Loại database: "redis" hoặc "aerospike" (phase 2)
+  type: aerospike # Loại database: "redis" hoặc "aerospike" (phase 2)
 
 
 # Cấu hình Redis Cluster
@@ -12,18 +12,21 @@ redis:
 #    - "172.16.115.27:6379"
 #    - "172.16.115.47:6379"
 #    - "172.16.115.36:6379"
-     - "redis-master-0.redis-cluster.hlcpc05.svc.cluster.local:6379"
-     - "redis-master-1.redis-cluster.hlcpc05.svc.cluster.local:6379"
-     - "redis-master-2.redis-cluster.hlcpc05.svc.cluster.local:6379"
-    # - redis-cluster.hlcpc05.svc.cluster.local:6379
+     - "redis-master-0.redis-cluster.db-benchmark.svc.cluster.local:6379"
+     - "redis-master-1.redis-cluster.db-benchmark.svc.cluster.local:6379"
+     - "redis-master-2.redis-cluster.db-benchmark.svc.cluster.local:6379"
+    # - redis-cluster.db-benchmark.svc.cluster.local:6379
 
 # Cấu hình Aerospike
 aerospike:
   hosts:                  # Tất cả host đều được dùng làm seed node
 #    - "172.16.129.183"
 #    - "172.16.6.163"
-    - "db-0.aerospike-headless.hlcpc05.svc.cluster.local:3000"
-    - "db-1.aerospike-headless.hlcpc05.svc.cluster.local:3000"
+#   - "db-0.aerospike.db-benchmark.svc.cluster.local:3000"
+#   - "db-1.aerospike.db-benchmark.svc.cluster.local:3000"
+    - db-0.aerospike.hlcpc01.svc.cluster.local:3000
+    - db-1.aerospike.hlcpc01.svc.cluster.local:3000
+    - db-2.aerospike.hlcpc01.svc.cluster.local:3000
   namespace: smf
   set: benchmark_session
   timeout: "3s"           # Timeout GET/SET/DELETE (giống ReadTimeout/WriteTimeout của Redis)
@@ -38,8 +41,7 @@ data:
 load:
   target_tps: 50000       # Số request/giây mục tiêu (chỉ dùng cho mode run)
   max_concurrency: 64     # Số worker song song
-  queue_size: 10 # Kích thước hàng đợi request. Nên >= target_tps / 100 (≥ 10ms tải);
-                          # 10000 ở 50k TPS ≈ 200ms đệm trước khi bắt đầu drop
+  queue_size: 10       # Kích thước hàng đợi request. 10000 ở 50k TPS ≈ 200ms đệm trước khi bắt đầu drop
 
 # Tỉ lệ workload (trọng số tương đối)
 # Ví dụ: get=50, set=30, delete=20 → 50% GET, 30% SET, 20% DELETE
@@ -49,8 +51,6 @@ workload:
   delete: 15
   query_tag: 10
   query_numeric: 5
-  query_or: 10
-  query_prefix: 5
 
 # Warmup: chạy trước khi đo chính thức, kết quả bị bỏ qua
 warmup:

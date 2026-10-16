@@ -30,8 +30,6 @@ const (
 	OpDelete                            // Xoá dữ liệu theo key
 	OpQueryTag                          // Truy vấn dữ liệu theo tag
 	OpQueryNumeric                      // Truy vấn dữ liệu theo dải số (numeric range)
-	OpQueryOr                           // Truy vấn hoán vị OR (Union)
-	OpQueryPrefix                       // Truy vấn tiền tố Prefix/Wildcard
 )
 
 // String trả về tên hiển thị của loại thao tác.
@@ -47,13 +45,29 @@ func (op OperationType) String() string {
 		return "QUERY_TAG"
 	case OpQueryNumeric:
 		return "QUERY_NUMERIC"
-	case OpQueryOr:
-		return "QUERY_OR"
-	case OpQueryPrefix:
-		return "QUERY_PREFIX"
 	default:
 		return "UNKNOWN"
 	}
+}
+
+// QuerySpec mô tả thông tin truy vấn tìm kiếm một cách độc lập với database backend.
+// Được dựng sẵn ngoài vùng đo latency (trong generator), giúp cả Redis và Aerospike
+// thực thi trực tiếp dạng native mà không cần parse/regex trong hot path.
+type QuerySpec struct {
+	Bin      string // Tên trường/bin cần lọc
+	IsRange  bool   // false: lọc đẳng thức (TAG/Equal); true: lọc khoảng số (NUMERIC/Range)
+	Value    string // Giá trị tìm kiếm khi IsRange = false
+	Min      int64  // Giá trị bắt đầu khi IsRange = true
+	Max      int64  // Giá trị kết thúc khi IsRange = true
+	RedisRaw string // Chuỗi truy vấn dựng sẵn cho RediSearch (@field:{val} hoặc @field:[min max])
+}
+
+// String trả về biểu diễn chuỗi của query (dùng cho log/debug).
+func (q *QuerySpec) String() string {
+	if q == nil {
+		return ""
+	}
+	return q.RedisRaw
 }
 
 // Request chứa thông tin một thao tác benchmark cần thực thi.
@@ -62,9 +76,9 @@ func (op OperationType) String() string {
 type Request struct {
 	Operation OperationType
 	Key       string
-	Payload   *Payload  // Chỉ dùng cho OpSet, nil cho OpGet/OpDelete/OpQuery...
-	QueryStr  string    // Dùng cho OpQueryTag, OpQueryNumeric
-	CreatedAt time.Time // Thời điểm request được phát ra (dùng để đo end-to-end latency gồm cả queue time)
+	Payload   *Payload   // Chỉ dùng cho OpSet, nil cho OpGet/OpDelete/OpQuery...
+	Query     *QuerySpec // Dùng cho OpQueryTag, OpQueryNumeric
+	CreatedAt time.Time  // Thời điểm request được phát ra (dùng để đo end-to-end latency gồm cả queue time)
 }
 
 // Database là interface trừu tượng cho mọi database backend.
@@ -93,9 +107,9 @@ type Database interface {
 	// Init khởi tạo các setup cần thiết trên DB (như đánh index)
 	Init(ctx context.Context) error
 
-	// Query thực hiện tìm kiếm bằng truy vấn (cú pháp RediSearch), lấy tối đa
-	// queryResultLimit kết quả. Kết quả phải bao phủ TOÀN BỘ dataset.
-	Query(ctx context.Context, query string) error
+	// Query thực hiện tìm kiếm bằng truy vấn QuerySpec, lấy tối đa
+	// queryResultLimit kết quả.
+	Query(ctx context.Context, query *QuerySpec) error
 
 	// Name trả về tên hiển thị của database (ví dụ: "Redis Cluster").
 	Name() string

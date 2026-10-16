@@ -49,7 +49,3 @@ spec:
             - "100"
             - "--query-numeric"
             - "0"
-            - "--query-or"
-            - "0"
-            - "--query-prefix"
-            - "0"

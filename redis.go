@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -124,10 +125,13 @@ func searchArgs(query string) []interface{} {
 	}
 }
 
-// Query thực thi truy vấn RediSearch.
+// Query thực thi truy vấn RediSearch từ chuỗi RedisRaw đã được sinh sẵn.
 // Từ Redis 8.0 OSS trở đi (hoặc khi có server-side coordinator),
 // server sẽ tự động fan-out query tới các shard và tổng hợp kết quả.
 // Tool benchmark chỉ cần gửi 1 lệnh duy nhất qua ClusterClient.
-func (r *RedisDB) Query(ctx context.Context, query string) error {
-	return r.client.Do(ctx, searchArgs(query)...).Err()
+func (r *RedisDB) Query(ctx context.Context, query *QuerySpec) error {
+	if query == nil {
+		return errors.New("nil query spec")
+	}
+	return r.client.Do(ctx, searchArgs(query.RedisRaw)...).Err()
 }
