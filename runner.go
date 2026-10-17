@@ -325,14 +325,16 @@ func (r *Runner) runOpenLoop(ctx context.Context) {
 		close(rcDone)
 	}()
 
-	// Chạy worker pool với trackLatency = true để tính P50/P95/P99 latency real-time
-	results, wait := wp.Start(ctx, requests, true)
+	// Chạy worker pool với trackLatency = true, cumulative = false
+	// để tính P50/P95/P99 latency real-time theo từng giây (sliding window)
+	// mà không bị phình bộ nhớ và không bị data race
+	results, wait := wp.Start(ctx, requests, true, false)
 
 	// Bắt đầu Reporter loop
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastScheduled int64
+	var lastSuccess, lastNotFound, lastErrors, lastIssued, lastScheduled, lastDropped int64
 	startTime := time.Now()
 	lastTick := startTime
 
@@ -350,14 +352,14 @@ reporterLoop:
 			var currentSuccess, currentNotFound, currentErrors int64
 			var currentLatencies []time.Duration
 
-			// Tổng hợp từ các worker
+			// Tổng hợp metrics và trích xuất latency của đúng 1 giây vừa qua (thread-safe qua SwapWindowLatencies)
 			for _, res := range results {
 				for i := 0; i < len(res.Ops); i++ {
 					currentSuccess += atomic.LoadInt64(&res.Ops[i].Success)
 					currentNotFound += atomic.LoadInt64(&res.Ops[i].NotFound)
 					currentErrors += atomic.LoadInt64(&res.Ops[i].Errors)
-					currentLatencies = append(currentLatencies, res.Ops[i].Latencies...)
 				}
+				currentLatencies = append(currentLatencies, res.SwapWindowLatencies()...)
 			}
 
 			currentScheduled := rc.Scheduled()
@@ -373,13 +375,14 @@ reporterLoop:
 			deltaSec := now.Sub(lastTick).Seconds()
 			lastTick = now
 
-			var schedTPS, sentTPS, ackTPS, errorTPS int64
+			var schedTPS, sentTPS, ackTPS, errorTPS, dropTPS int64
 			if deltaSec > 0 {
 				schedTPS = int64(float64(currentScheduled-lastScheduled) / deltaSec)
 				sentTPS = int64(float64(currentIssued-lastIssued) / deltaSec)
 				lastCompleted := lastSuccess + lastNotFound + lastErrors
 				ackTPS = int64(float64(currentCompleted-lastCompleted) / deltaSec)
 				errorTPS = int64(float64(currentErrors-lastErrors) / deltaSec)
+				dropTPS = int64(float64(currentDropped-lastDropped) / deltaSec)
 			}
 
 			errorRate := 0.0
@@ -387,7 +390,7 @@ reporterLoop:
 				errorRate = float64(errorTPS) / float64(ackTPS) * 100
 			}
 
-			// Tính latency percentiles tích luỹ
+			// Tính latency percentiles chuẩn xác của 1 giây vừa qua (Realtime Window)
 			var p50, p95, p99 time.Duration
 			if len(currentLatencies) > 0 {
 				sort.Slice(currentLatencies, func(i, j int) bool {
@@ -399,15 +402,16 @@ reporterLoop:
 			}
 
 			elapsed := time.Since(startTime)
-			fmt.Printf("[%02d:%02d:%02d] Sched: %5d/s | Sent: %5d/s | Ack: %5d/s (Err: %4d, %5.2f%%) | Drop: %d | InFlight: %4d | P50: %v | P95: %v | P99: %v\n",
+			fmt.Printf("[%02d:%02d:%02d] Sched: %5d/s | Sent: %5d/s | Ack: %5d/s (Err: %4d, %5.2f%%) | Drop: %4d/s (tot %d) | InFlight: %4d | P50: %v | P95: %v | P99: %v\n",
 				int(elapsed.Hours()), int(elapsed.Minutes())%60, int(elapsed.Seconds())%60,
-				schedTPS, sentTPS, ackTPS, errorTPS, errorRate, currentDropped, inFlight, p50, p95, p99)
+				schedTPS, sentTPS, ackTPS, errorTPS, errorRate, dropTPS, currentDropped, inFlight, p50, p95, p99)
 
 			lastScheduled = currentScheduled
 			lastSuccess = currentSuccess
 			lastNotFound = currentNotFound
 			lastErrors = currentErrors
 			lastIssued = currentIssued
+			lastDropped = currentDropped
 		}
 	}
 
@@ -415,4 +419,46 @@ reporterLoop:
 	<-rcDone
 	wait()
 	fmt.Println("Open-loop benchmark stopped.")
+
+	// In bảng tổng kết toàn bộ phiên chạy open-loop
+	totalElapsed := time.Since(startTime)
+	var finalSuccess, finalNotFound, finalErrors int64
+	for _, res := range results {
+		for i := 0; i < len(res.Ops); i++ {
+			finalSuccess += atomic.LoadInt64(&res.Ops[i].Success)
+			finalNotFound += atomic.LoadInt64(&res.Ops[i].NotFound)
+			finalErrors += atomic.LoadInt64(&res.Ops[i].Errors)
+		}
+	}
+	finalScheduled := rc.Scheduled()
+	finalIssued := rc.Issued()
+	finalDropped := rc.Dropped()
+	finalCompleted := finalSuccess + finalNotFound + finalErrors
+
+	fmt.Println("\n============================================")
+	fmt.Println("       Open-Loop Summary Report")
+	fmt.Println("============================================")
+	fmt.Printf("Duration:         %v\n", totalElapsed.Round(time.Millisecond))
+	fmt.Printf("Target TPS:       %d\n", r.cfg.Load.TargetTPS)
+	if totalElapsed.Seconds() > 0 {
+		fmt.Printf("Scheduled TPS:    %.2f\n", float64(finalScheduled)/totalElapsed.Seconds())
+		fmt.Printf("Issued TPS:       %.2f\n", float64(finalIssued)/totalElapsed.Seconds())
+		fmt.Printf("Completed TPS:    %.2f\n", float64(finalCompleted)/totalElapsed.Seconds())
+		fmt.Printf("Success TPS:      %.2f\n", float64(finalSuccess)/totalElapsed.Seconds())
+		fmt.Printf("Error TPS:        %.2f\n", float64(finalErrors)/totalElapsed.Seconds())
+	}
+	fmt.Println()
+	fmt.Printf("Total Scheduled:  %d\n", finalScheduled)
+	fmt.Printf("Total Issued:     %d\n", finalIssued)
+	fmt.Printf("Total Completed:  %d\n", finalCompleted)
+	fmt.Printf("Success:          %d\n", finalSuccess)
+	if finalNotFound > 0 {
+		fmt.Printf("Not Found:        %d\n", finalNotFound)
+	}
+	fmt.Printf("Errors:           %d\n", finalErrors)
+	fmt.Printf("Dropped:          %d\n", finalDropped)
+	if finalCompleted > 0 {
+		fmt.Printf("Error Rate:       %.2f%%\n", float64(finalErrors)/float64(finalCompleted)*100)
+	}
+	fmt.Println("============================================")
 }

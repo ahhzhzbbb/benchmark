@@ -47,7 +47,7 @@ func createDatabase(cfg Config) (Database, error) {
 	case "redis":
 		return NewRedisDB(cfg.Redis.Addresses, cfg.Load.MaxConcurrency)
 	case "aerospike":
-		return NewAerospikeDB(cfg.Aerospike)
+		return NewAerospikeDB(cfg.Aerospike, cfg.Data.KeyCount)
 	default:
 		return nil, fmt.Errorf("database type không hỗ trợ: %s", cfg.Database.Type)
 	}

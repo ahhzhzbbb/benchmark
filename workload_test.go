@@ -329,8 +329,8 @@ func TestQuerySpecFormat(t *testing.T) {
 	}
 }
 
-// TestQueriesTagSingleFieldDnn kiểm tra tất cả các tag query đều chỉ lọc trên trường Dnn.
-func TestQueriesTagSingleFieldDnn(t *testing.T) {
+// TestQueriesTagSingleFieldSEID kiểm tra tất cả các tag query đều lọc trên trường SEID (point lookup).
+func TestQueriesTagSingleFieldSEID(t *testing.T) {
 	cfg := runWorkloadCfg(0, 0, 0, 100, 0)
 	gen := NewWorkloadGenerator(cfg, 12345, NewKeySpace(cfg.Data.KeyCount))
 
@@ -342,11 +342,11 @@ func TestQueriesTagSingleFieldDnn(t *testing.T) {
 		if req.Operation != OpQueryTag {
 			t.Fatalf("expected OpQueryTag, got %v", req.Operation)
 		}
-		if req.Query == nil || !strings.HasPrefix(req.Query.RedisRaw, "@Dnn:{Dnn_") || !strings.HasSuffix(req.Query.RedisRaw, "}") {
+		if req.Query == nil || !strings.HasPrefix(req.Query.RedisRaw, "@SEID:{SEID_") || !strings.HasSuffix(req.Query.RedisRaw, "}") {
 			t.Fatalf("unexpected query format: %v", req.Query)
 		}
-		if req.Query.Bin != "Dnn" || req.Query.IsRange {
-			t.Fatalf("expected non-range Dnn query, got %v", req.Query)
+		if req.Query.Bin != "SEID" || req.Query.IsRange {
+			t.Fatalf("expected non-range SEID query, got %v", req.Query)
 		}
 	}
 }

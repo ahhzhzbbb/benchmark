@@ -54,12 +54,13 @@ func (op OperationType) String() string {
 // Được dựng sẵn ngoài vùng đo latency (trong generator), giúp cả Redis và Aerospike
 // thực thi trực tiếp dạng native mà không cần parse/regex trong hot path.
 type QuerySpec struct {
-	Bin      string // Tên trường/bin cần lọc
-	IsRange  bool   // false: lọc đẳng thức (TAG/Equal); true: lọc khoảng số (NUMERIC/Range)
-	Value    string // Giá trị tìm kiếm khi IsRange = false
-	Min      int64  // Giá trị bắt đầu khi IsRange = true
-	Max      int64  // Giá trị kết thúc khi IsRange = true
-	RedisRaw string // Chuỗi truy vấn dựng sẵn cho RediSearch (@field:{val} hoặc @field:[min max])
+	Bin       string        // Tên trường/bin cần lọc
+	IsRange   bool          // false: lọc đẳng thức (TAG/Equal); true: lọc khoảng số (NUMERIC/Range)
+	Value     string        // Giá trị tìm kiếm khi IsRange = false
+	Min       int64         // Giá trị bắt đầu khi IsRange = true
+	Max       int64         // Giá trị kết thúc khi IsRange = true
+	RedisRaw  string        // Chuỗi truy vấn dựng sẵn cho RediSearch (@field:{val} hoặc @field:[min max])
+	RedisArgs []interface{} // Tham số hoàn chỉnh dựng sẵn cho FT.SEARCH (zero allocation trong hot path)
 }
 
 // String trả về biểu diễn chuỗi của query (dùng cho log/debug).

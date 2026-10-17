@@ -33,6 +33,9 @@ func NewRedisDB(addrs []string, maxConcurrency int) (*RedisDB, error) {
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
+		// MaxRedirects: -1 tắt tự động retry khi gặp lỗi mạng/redirect (trong go-redis -1 được chuẩn hoá thành 0 retry).
+		// Đảm bảo đối xứng và công bằng với Aerospike (MaxRetries = 0), phản ánh chính xác latency của 1 lần gọi duy nhất.
+		MaxRedirects: -1,
 	})
 	return &RedisDB{client: rdb}, nil
 }
@@ -115,13 +118,18 @@ func (r *RedisDB) Init(ctx context.Context) error {
 	})
 }
 
+var (
+	queryTimeoutMsStr   = strconv.Itoa(queryTimeoutMs)
+	queryResultLimitStr = strconv.Itoa(queryResultLimit)
+)
+
 // searchArgs tạo tham số FT.SEARCH. NOCONTENT: chỉ trả về id, giảm I/O mạng.
 func searchArgs(query string) []interface{} {
 	return []interface{}{
 		"FT.SEARCH", redisIndexName, query,
-		"TIMEOUT", strconv.Itoa(queryTimeoutMs),
+		"TIMEOUT", queryTimeoutMsStr,
 		"NOCONTENT",
-		"LIMIT", "0", strconv.Itoa(queryResultLimit),
+		"LIMIT", "0", queryResultLimitStr,
 	}
 }
 
@@ -132,6 +140,9 @@ func searchArgs(query string) []interface{} {
 func (r *RedisDB) Query(ctx context.Context, query *QuerySpec) error {
 	if query == nil {
 		return errors.New("nil query spec")
+	}
+	if len(query.RedisArgs) > 0 {
+		return r.client.Do(ctx, query.RedisArgs...).Err()
 	}
 	return r.client.Do(ctx, searchArgs(query.RedisRaw)...).Err()
 }

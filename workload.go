@@ -267,13 +267,19 @@ func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *Workloa
 	queriesTag := make([]*QuerySpec, 0, queryPoolSize)
 
 	for i := 0; i < queryPoolSize; i++ {
-		// Single-field tag query: Dnn (100 distinct values: Dnn_0 .. Dnn_99) -> ~1% dataset match
-		val := "Dnn_" + strconv.Itoa(queryRng.Intn(100))
+		// Single-field tag query: SEID point lookup (high cardinality -> exact 1 record match)
+		keyCount := cfg.Data.KeyCount
+		if keyCount <= 0 {
+			keyCount = 100000
+		}
+		val := "SEID_" + strconv.Itoa(queryRng.Intn(keyCount))
+		raw := "@SEID:{" + val + "}"
 		queriesTag = append(queriesTag, &QuerySpec{
-			Bin:      "Dnn",
-			IsRange:  false,
-			Value:    val,
-			RedisRaw: "@Dnn:{" + val + "}",
+			Bin:       "SEID",
+			IsRange:   false,
+			Value:     val,
+			RedisRaw:  raw,
+			RedisArgs: searchArgs(raw),
 		})
 	}
 
@@ -285,34 +291,40 @@ func NewWorkloadGenerator(cfg Config, streamSeed int64, keys *KeySpace) *Workloa
 			// Timer range (width 10)
 			tStart := int64(queryRng.Intn(90))
 			tEnd := tStart + 10
+			raw := "@Timer:[" + strconv.FormatInt(tStart, 10) + " " + strconv.FormatInt(tEnd, 10) + "]"
 			queriesNumeric = append(queriesNumeric, &QuerySpec{
-				Bin:      "Timer",
-				IsRange:  true,
-				Min:      tStart,
-				Max:      tEnd,
-				RedisRaw: "@Timer:[" + strconv.FormatInt(tStart, 10) + " " + strconv.FormatInt(tEnd, 10) + "]",
+				Bin:       "Timer",
+				IsRange:   true,
+				Min:       tStart,
+				Max:       tEnd,
+				RedisRaw:  raw,
+				RedisArgs: searchArgs(raw),
 			})
 		case 1:
 			// startTime range (width 5000)
 			sStart := int64(1700000000 + queryRng.Intn(9995000))
 			sEnd := sStart + 5000
+			raw := "@startTime:[" + strconv.FormatInt(sStart, 10) + " " + strconv.FormatInt(sEnd, 10) + "]"
 			queriesNumeric = append(queriesNumeric, &QuerySpec{
-				Bin:      "startTime",
-				IsRange:  true,
-				Min:      sStart,
-				Max:      sEnd,
-				RedisRaw: "@startTime:[" + strconv.FormatInt(sStart, 10) + " " + strconv.FormatInt(sEnd, 10) + "]",
+				Bin:       "startTime",
+				IsRange:   true,
+				Min:       sStart,
+				Max:       sEnd,
+				RedisRaw:  raw,
+				RedisArgs: searchArgs(raw),
 			})
 		case 2:
 			// UpfSelection range (width 10000)
 			uStart := int64(queryRng.Intn(1999900000))
 			uEnd := uStart + 10000
+			raw := "@UpfSelection:[" + strconv.FormatInt(uStart, 10) + " " + strconv.FormatInt(uEnd, 10) + "]"
 			queriesNumeric = append(queriesNumeric, &QuerySpec{
-				Bin:      "UpfSelection",
-				IsRange:  true,
-				Min:      uStart,
-				Max:      uEnd,
-				RedisRaw: "@UpfSelection:[" + strconv.FormatInt(uStart, 10) + " " + strconv.FormatInt(uEnd, 10) + "]",
+				Bin:       "UpfSelection",
+				IsRange:   true,
+				Min:       uStart,
+				Max:       uEnd,
+				RedisRaw:  raw,
+				RedisArgs: searchArgs(raw),
 			})
 		}
 	}

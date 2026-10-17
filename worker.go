@@ -31,9 +31,33 @@ type OpMetrics struct {
 }
 
 // WorkerResult chứa kết quả thu thập từ một worker trong suốt quá trình benchmark.
-// Mỗi worker có WorkerResult riêng, không chia sẻ → không cần lock/mutex.
 type WorkerResult struct {
 	Ops [5]OpMetrics // 0: GET, 1: SET, 2: DELETE, 3: QUERY_TAG, 4: QUERY_NUMERIC
+
+	mu              sync.Mutex
+	windowLatencies []time.Duration // Latency của window hiện tại (dùng cho open-loop realtime per-second)
+}
+
+// RecordLatency ghi nhận latency một cách thread-safe.
+// cumulative = true: lưu toàn bộ latency vào Ops[op].Latencies (dùng cho mode run).
+// cumulative = false: chỉ lưu vào windowLatencies (dùng cho mode open-loop, tránh rò rỉ RAM).
+func (r *WorkerResult) RecordLatency(op int, latency time.Duration, cumulative bool) {
+	r.mu.Lock()
+	if cumulative {
+		r.Ops[op].Latencies = append(r.Ops[op].Latencies, latency)
+	}
+	r.windowLatencies = append(r.windowLatencies, latency)
+	r.mu.Unlock()
+}
+
+// SwapWindowLatencies trích xuất toàn bộ latency trong 1 giây vừa qua và hoán đổi buffer mới.
+// Thao tác lock cực nhanh (<50ns) chỉ để swap con trỏ slice, loại bỏ 100% Data Race.
+func (r *WorkerResult) SwapWindowLatencies() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := r.windowLatencies
+	r.windowLatencies = make([]time.Duration, 0, 1024)
+	return res
 }
 
 // WorkerPool quản lý một nhóm worker goroutine.
@@ -52,22 +76,20 @@ func NewWorkerPool(db Database, concurrency int) *WorkerPool {
 	}
 }
 
-// Run khởi chạy tất cả worker và chờ chúng hoàn thành.
-// Mỗi worker đọc request từ channel requests, thực thi lên database,
-// đo latency và lưu kết quả cục bộ.
-//
-// Run trả về danh sách WorkerResult từ tất cả worker sau khi channel
-// requests bị đóng hoặc ctx bị cancel.
-func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackLatency bool) ([]*WorkerResult, func()) {
+// Start khởi chạy tất cả worker dưới nền và trả về danh sách WorkerResult cùng hàm wait.
+// cumulative=true: lưu giữ toàn bộ latency (dùng cho mode run).
+// cumulative=false: chỉ dùng windowLatencies (dùng cho open-loop mode, tránh phình bộ nhớ).
+func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackLatency bool, cumulative bool) ([]*WorkerResult, func()) {
 	results := make([]*WorkerResult, wp.concurrency)
 	var wg sync.WaitGroup
 
 	for i := 0; i < wp.concurrency; i++ {
 		wg.Add(1)
-		res := &WorkerResult{}
-		for j := 0; j < len(res.Ops); j++ {
-			// Pre-allocate slice latency để giảm re-allocation khi benchmark đang chạy
-			if trackLatency {
+		res := &WorkerResult{
+			windowLatencies: make([]time.Duration, 0, 1024),
+		}
+		if trackLatency && cumulative {
+			for j := 0; j < len(res.Ops); j++ {
 				res.Ops[j].Latencies = make([]time.Duration, 0, 256)
 			}
 		}
@@ -75,7 +97,7 @@ func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackL
 
 		go func(workerID int, result *WorkerResult) {
 			defer wg.Done()
-			workerLoop(ctx, wp.db, requests, result, trackLatency)
+			workerLoop(ctx, wp.db, requests, result, trackLatency, cumulative)
 		}(i, results[i])
 	}
 
@@ -83,50 +105,32 @@ func (wp *WorkerPool) Start(ctx context.Context, requests <-chan Request, trackL
 }
 
 // Run khởi chạy tất cả worker và chờ chúng hoàn thành.
-// Mỗi worker đọc request từ channel requests, thực thi lên database,
-// đo latency và lưu kết quả cục bộ.
-//
-// Run trả về danh sách WorkerResult từ tất cả worker sau khi channel
-// requests bị đóng hoặc ctx bị cancel.
 func (wp *WorkerPool) Run(ctx context.Context, requests <-chan Request, trackLatency bool) []*WorkerResult {
-	results, wait := wp.Start(ctx, requests, trackLatency)
+	results, wait := wp.Start(ctx, requests, trackLatency, true)
 	wait()
 	return results
 }
 
 // workerLoop là vòng lặp chính của mỗi worker.
-// Worker lấy request từ channel, thực thi lên database và ghi nhận kết quả.
-//
-// Latency chỉ đo thời gian thực thi database operation,
-// KHÔNG bao gồm thời gian request nằm chờ trong queue.
-func workerLoop(ctx context.Context, db Database, requests <-chan Request, result *WorkerResult, trackLatency bool) {
+func workerLoop(ctx context.Context, db Database, requests <-chan Request, result *WorkerResult, trackLatency bool, cumulative bool) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case req, ok := <-requests:
 			if !ok {
-				// Channel đã đóng, không còn request mới
 				return
 			}
-			executeRequest(db, req, result, trackLatency)
+			executeRequest(db, req, result, trackLatency, cumulative)
 		}
 	}
 }
 
 // executeRequest thực thi một request lên database và ghi nhận kết quả.
-// Đo latency từ lúc bắt đầu gọi database đến lúc nhận response.
-//
-// Sử dụng context.Background() thay vì workerCtx để tránh context cancellation
-// cascade: khi workerCtx hết hạn, DB calls đang in-flight sẽ KHÔNG bị cancel,
-// cho phép đo latency chính xác. go-redis built-in timeouts (ReadTimeout=3s)
-// cung cấp safety net chống hang.
-func executeRequest(db Database, req Request, result *WorkerResult, trackLatency bool) {
+// DB Latency (Service Time): Đo từ lúc bắt đầu gọi DB đến khi nhận response (loại trừ hoàn toàn thời gian chờ trong queue).
+func executeRequest(db Database, req Request, result *WorkerResult, trackLatency bool, cumulative bool) {
 	ctx := context.Background()
-	start := req.CreatedAt
-	if start.IsZero() {
-		start = time.Now()
-	}
+	start := time.Now() // DB Latency (Service Time)
 	var err error
 
 	switch req.Operation {
@@ -144,12 +148,12 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 	op := int(req.Operation)
 
 	atomic.AddInt64(&result.Ops[op].Completed, 1)
-	if trackLatency {
-		result.Ops[op].Latencies = append(result.Ops[op].Latencies, latency)
-	}
 
 	if err == nil {
 		atomic.AddInt64(&result.Ops[op].Success, 1)
+		if trackLatency {
+			result.RecordLatency(op, latency, cumulative)
+		}
 		return
 	}
 
