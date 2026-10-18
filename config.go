@@ -54,6 +54,7 @@ type LoadCfg struct {
 	TargetTPS      int `yaml:"target_tps"`      // Số request/giây mục tiêu
 	MaxConcurrency int `yaml:"max_concurrency"` // Số worker tối đa (giới hạn in-flight requests)
 	QueueSize      int `yaml:"queue_size"`      // Kích thước request queue
+	GOMAXPROCS     int `yaml:"gomaxprocs"`      // Giới hạn GOMAXPROCS (0: giữ nguyên mặc định hệ thống)
 }
 
 // WorkloadCfg cấu hình tỉ lệ các loại thao tác.
@@ -111,6 +112,7 @@ func LoadConfig() (Config, error) {
 	queryTagOverride := flag.Int("query-tag", -1, "Override QUERY_TAG workload ratio (-1 to use config file value)")
 	queryNumericOverride := flag.Int("query-numeric", -1, "Override QUERY_NUMERIC workload ratio (-1 to use config file value)")
 	keyCountOverride := flag.Int("key-count", 0, "Override number of records/keys to load (0 to use config file value)")
+	gomaxprocsOverride := flag.Int("gomaxprocs", 0, "Override GOMAXPROCS (0 to use config file value or system default)")
 	flag.Parse()
 
 	cfg := defaultConfig()
@@ -158,6 +160,10 @@ func LoadConfig() (Config, error) {
 
 	if *keyCountOverride > 0 {
 		cfg.Data.KeyCount = *keyCountOverride
+	}
+
+	if *gomaxprocsOverride > 0 {
+		cfg.Load.GOMAXPROCS = *gomaxprocsOverride
 	}
 
 	if err := cfg.validate(); err != nil {

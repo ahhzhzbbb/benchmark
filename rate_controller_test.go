@@ -57,3 +57,60 @@ func TestRateControllerStandaloneFast(t *testing.T) {
 		t.Errorf("dropped = %d, expected 0", dropped)
 	}
 }
+
+func TestRateControllerGroup(t *testing.T) {
+	targetTPS := 105
+	concurrency := 10
+	group := NewRateControllerGroup(targetTPS, concurrency)
+
+	if len(group) != concurrency {
+		t.Fatalf("expected %d controllers, got %d", concurrency, len(group))
+	}
+
+	totalConfiguredTPS := 0
+	for _, rc := range group {
+		totalConfiguredTPS += rc.targetTPS
+	}
+	if totalConfiguredTPS != targetTPS {
+		t.Errorf("expected total target TPS %d, got %d", targetTPS, totalConfiguredTPS)
+	}
+
+	// Chạy thử group trong 1 giây với consumer song song
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	channels := make([]chan Request, concurrency)
+	for i := 0; i < concurrency; i++ {
+		channels[i] = make(chan Request, 100)
+		go func(ch chan Request) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ch:
+				}
+			}
+		}(channels[i])
+	}
+
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			group[idx].Run(ctx, &dummyGen{}, channels[idx])
+		}(i)
+	}
+
+	<-ctx.Done()
+	time.Sleep(50 * time.Millisecond)
+
+	sched := group.Scheduled()
+	issued := group.Issued()
+	dropped := group.Dropped()
+
+	t.Logf("Group Sched: %d, Issued: %d, Dropped: %d", sched, issued, dropped)
+	if issued < int64(targetTPS)*90/100 {
+		t.Errorf("issued %d quá thấp so với expected ~%d", issued, targetTPS)
+	}
+	if dropped != 0 {
+		t.Errorf("dropped = %d, expected 0", dropped)
+	}
+}

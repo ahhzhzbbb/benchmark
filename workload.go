@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 )
 
@@ -35,7 +36,9 @@ const warmupSeedOffset = 1_000_003
 // KHÔNG thread-safe: chỉ được dùng bởi một goroutine tại một thời điểm
 // (goroutine pre-generate của RateController). KeySpace được chia sẻ giữa
 // warmup và measurement để trạng thái live/dead được giữ liên tục.
+// Thread-safe: có thể được gọi đồng thời bởi nhiều worker.
 type KeySpace struct {
+	mu    sync.Mutex
 	keys  []string // key string đã tính sẵn, index = record id
 	live  []int32  // danh sách id đang tồn tại
 	dead  []int32  // danh sách id đã bị DELETE
@@ -65,9 +68,13 @@ func NewKeySpace(n int) *KeySpace {
 func (ks *KeySpace) Len() int { return len(ks.keys) }
 
 // LiveCount trả về số key đang tồn tại.
-func (ks *KeySpace) LiveCount() int { return len(ks.live) }
+func (ks *KeySpace) LiveCount() int {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	return len(ks.live)
+}
 
-// Key trả về key string của id.
+// Key trả về key string của id. Không đổi sau khi init nên không cần lock.
 func (ks *KeySpace) Key(id int32) string { return ks.keys[id] }
 
 // swapRemove xoá id khỏi list bằng cách đổi chỗ với phần tử cuối (O(1)).
@@ -82,14 +89,17 @@ func swapRemove(list []int32, pos []int32, id int32) []int32 {
 // randomLive chọn ngẫu nhiên một key đang tồn tại.
 // ok=false nếu không còn key live (khi đó trả về một id bất kỳ).
 func (ks *KeySpace) randomLive(rng *rand.Rand) (id int32, ok bool) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
 	if len(ks.live) == 0 {
 		return int32(rng.Intn(len(ks.keys))), false
 	}
 	return ks.live[rng.Intn(len(ks.live))], true
 }
 
-// markDeleted chuyển id từ live sang dead.
 func (ks *KeySpace) markDeleted(id int32) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
 	if !ks.alive[id] {
 		return
 	}
@@ -99,8 +109,7 @@ func (ks *KeySpace) markDeleted(id int32) {
 	ks.alive[id] = false
 }
 
-// markLive chuyển id từ dead sang live.
-func (ks *KeySpace) markLive(id int32) {
+func (ks *KeySpace) markLiveLocked(id int32) {
 	if ks.alive[id] {
 		return
 	}
@@ -110,16 +119,26 @@ func (ks *KeySpace) markLive(id int32) {
 	ks.alive[id] = true
 }
 
+func (ks *KeySpace) markLive(id int32) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	ks.markLiveLocked(id)
+}
+
 // pickForSet chọn key cho SET: ưu tiên tái tạo một key đã bị xoá,
 // nếu không có thì chọn ngẫu nhiên một key đang tồn tại (update).
 func (ks *KeySpace) pickForSet(rng *rand.Rand) int32 {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
 	if len(ks.dead) > 0 {
 		id := ks.dead[rng.Intn(len(ks.dead))]
-		ks.markLive(id)
+		ks.markLiveLocked(id)
 		return id
 	}
-	id, _ := ks.randomLive(rng)
-	return id
+	if len(ks.live) == 0 {
+		return int32(rng.Intn(len(ks.keys)))
+	}
+	return ks.live[rng.Intn(len(ks.live))]
 }
 
 // ---------------------------------------------------------------------------

@@ -44,7 +44,10 @@ type RateController struct {
 // NewRateController tạo rate controller cho target TPS đã cho.
 // interval = 1s / targetTPS, ví dụ: 50000 TPS → interval = 20µs.
 func NewRateController(targetTPS int) *RateController {
-	interval := time.Duration(float64(time.Second) / float64(targetTPS))
+	var interval time.Duration
+	if targetTPS > 0 {
+		interval = time.Duration(float64(time.Second) / float64(targetTPS))
+	}
 	return &RateController{
 		interval:  interval,
 		targetTPS: targetTPS,
@@ -63,6 +66,10 @@ func NewRateController(targetTPS int) *RateController {
 // Run chạy blocking trong goroutine riêng. Khi ctx bị cancel, Run thoát
 // và trả về tổng số request đã phát thành công (issued).
 func (rc *RateController) Run(ctx context.Context, gen Generator, requests chan<- Request) int64 {
+	if rc.targetTPS <= 0 {
+		<-ctx.Done()
+		return 0
+	}
 	// --- Pre-generate goroutine ---
 	// Sinh request trước vào buffer, chạy song song với vòng lặp dispatch.
 	// Chi phí gen.Next() (RNG, string formatting, v.v.) được chuyển sang goroutine này,
@@ -196,4 +203,60 @@ func (rc *RateController) Issued() int64 {
 // TotalSlip trả về tổng thời gian slip (nanoseconds).
 func (rc *RateController) TotalSlip() int64 {
 	return atomic.LoadInt64(&rc.totalSlip)
+}
+
+// RateControllerGroup tập hợp các RateController được phân tán cho từng worker.
+// Chia nhỏ targetTPS thành concurrency rate controllers độc lập, loại bỏ hoàn toàn
+// tranh chấp khóa trên channel trung tâm (centralized lock contention).
+type RateControllerGroup []*RateController
+
+// NewRateControllerGroup khởi tạo nhóm RateController, chia đều targetTPS cho concurrency workers.
+func NewRateControllerGroup(targetTPS, concurrency int) RateControllerGroup {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	baseTPS := targetTPS / concurrency
+	rem := targetTPS % concurrency
+
+	group := make(RateControllerGroup, concurrency)
+	for i := 0; i < concurrency; i++ {
+		tps := baseTPS
+		if i < rem {
+			tps++
+		}
+		group[i] = NewRateController(tps)
+	}
+	return group
+}
+
+func (g RateControllerGroup) Scheduled() int64 {
+	var total int64
+	for _, rc := range g {
+		total += rc.Scheduled()
+	}
+	return total
+}
+
+func (g RateControllerGroup) Dropped() int64 {
+	var total int64
+	for _, rc := range g {
+		total += rc.Dropped()
+	}
+	return total
+}
+
+func (g RateControllerGroup) Issued() int64 {
+	var total int64
+	for _, rc := range g {
+		total += rc.Issued()
+	}
+	return total
+}
+
+func (g RateControllerGroup) TotalSlip() int64 {
+	var total int64
+	for _, rc := range g {
+		total += rc.TotalSlip()
+	}
+	return total
 }

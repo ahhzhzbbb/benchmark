@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -183,52 +185,92 @@ func (r *Runner) runLoad(ctx context.Context) {
 
 // runPhase chạy một phase (warmup) trong khoảng thời gian duration.
 // Kết quả metrics bị bỏ qua - dùng cho warmup.
-//
-// Flow bên trong giống measurement nhưng không thu thập kết quả:
-//   - RateController phát request vào queue theo target TPS
-//   - WorkerPool nhận và thực thi request
-//   - Khi hết duration, tất cả dừng lại
 func (r *Runner) runPhase(ctx context.Context, duration time.Duration, streamSeed int64) {
 	phaseCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 
-	requests := make(chan Request, r.cfg.Load.QueueSize)
+	concurrency := r.cfg.Load.MaxConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	queueSizePerWorker := r.cfg.Load.QueueSize / concurrency
+	if queueSizePerWorker < 2 {
+		queueSizePerWorker = 2
+	}
 
-	gen := NewWorkloadGenerator(r.cfg, streamSeed, r.keys)
-	rc := NewRateController(r.cfg.Load.TargetTPS)
-	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
+	rcs := NewRateControllerGroup(r.cfg.Load.TargetTPS, concurrency)
+	reqChans := make([]chan Request, concurrency)
+	gens := make([]*WorkloadGenerator, concurrency)
 
-	// Chạy rate controller trong goroutine riêng
-	rcDone := make(chan struct{})
-	go func() {
-		rc.Run(phaseCtx, gen, requests)
-		close(requests) // Đóng channel để worker biết không còn request mới
-		close(rcDone)
-	}()
+	for i := 0; i < concurrency; i++ {
+		reqChans[i] = make(chan Request, queueSizePerWorker)
+		gens[i] = NewWorkloadGenerator(r.cfg, streamSeed+int64(i)*10007, r.keys)
+	}
 
-	// Chạy worker pool (blocking đến khi tất cả worker hoàn thành)
-	wp.Run(phaseCtx, requests, false)
-	<-rcDone
+	var rcWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		rcWg.Add(1)
+		go func(idx int) {
+			defer rcWg.Done()
+			rcs[idx].Run(phaseCtx, gens[idx], reqChans[idx])
+			close(reqChans[idx])
+		}(i)
+	}
+
+	dummyRes := &WorkerResult{}
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func(idx int) {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-phaseCtx.Done():
+					return
+				case req, ok := <-reqChans[idx]:
+					if !ok {
+						return
+					}
+					executeRequest(r.db, req, dummyRes, false, false)
+				}
+			}
+		}(i)
+	}
+
+	rcWg.Wait()
+	workerWg.Wait()
 }
 
 // runMeasurement chạy measurement phase và trả về kết quả benchmark.
-//
-// Sử dụng hai context riêng biệt:
-//   - genCtx: cho RateController, hết hạn sau benchmark duration
-//   - workerCtx: cho WorkerPool, hết hạn sau benchmark duration + grace period
-//
-// Lý do tách: sau khi RateController dừng phát request, WorkerPool cần
-// thêm thời gian (grace period) để drain hết request còn trong queue.
-// Nếu grace period hết mà vẫn còn request in-flight, worker sẽ bị force-stop.
+// Sử dụng phân tán RateController theo từng worker để triệt tiêu 100% lock contention trên channel.
 func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
-	requests := make(chan Request, r.cfg.Load.QueueSize)
+	concurrency := r.cfg.Load.MaxConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
-	gen := NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed, r.keys)
-	rc := NewRateController(r.cfg.Load.TargetTPS)
-	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
+	queueSizePerWorker := r.cfg.Load.QueueSize / concurrency
+	if queueSizePerWorker < 2 {
+		queueSizePerWorker = 2
+	}
 
-	var issued int64
-	var genDuration time.Duration // thời gian thực tế rate controller chạy (measurement window)
+	rcs := NewRateControllerGroup(r.cfg.Load.TargetTPS, concurrency)
+	reqChans := make([]chan Request, concurrency)
+	gens := make([]*WorkloadGenerator, concurrency)
+	results := make([]*WorkerResult, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		reqChans[i] = make(chan Request, queueSizePerWorker)
+		gens[i] = NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed+int64(i)*10007, r.keys)
+		res := &WorkerResult{
+			windowLatencies: make([]time.Duration, 0, 2048),
+		}
+		for j := 0; j < len(res.Ops); j++ {
+			res.Ops[j].Latencies = make([]time.Duration, 0, 256)
+		}
+		results[i] = res
+	}
+
 	start := time.Now()
 
 	// Context cho rate controller: hết hạn sau benchmark duration
@@ -236,29 +278,51 @@ func (r *Runner) runMeasurement(ctx context.Context) *BenchmarkResult {
 	defer genCancel()
 
 	// Context cho worker: benchmark duration + grace period
-	// Cho phép worker drain hết request còn trong queue trước khi dừng
 	totalDuration := r.cfg.Benchmark.Duration.Duration + r.cfg.Shutdown.GracePeriod.Duration
 	workerCtx, workerCancel := context.WithTimeout(ctx, totalDuration)
 	defer workerCancel()
 
-	// Chạy rate controller trong goroutine riêng
-	rcDone := make(chan struct{})
-	go func() {
-		issued = rc.Run(genCtx, gen, requests)
-		genDuration = time.Since(start) // Đo measurement window = thời gian rate controller active
-		close(requests)                 // Đóng channel → worker biết không còn request mới
-		close(rcDone)
-	}()
+	var rcWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		rcWg.Add(1)
+		go func(idx int) {
+			defer rcWg.Done()
+			rcs[idx].Run(genCtx, gens[idx], reqChans[idx])
+			close(reqChans[idx])
+		}(i)
+	}
 
-	// Chạy worker pool (blocking đến khi tất cả worker hoàn thành hoặc ctx hết hạn)
-	results := wp.Run(workerCtx, requests, true)
-	<-rcDone                            // sync: đảm bảo genDuration đã được ghi trước khi đọc (happens-before)
-	workerDuration := time.Since(start) // thời gian thực tế workers chạy (bao gồm grace period)
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func(idx int) {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case req, ok := <-reqChans[idx]:
+					if !ok {
+						return
+					}
+					executeRequest(r.db, req, results[idx], true, true)
+				}
+			}
+		}(i)
+	}
 
-	// Tổng hợp kết quả với 2 duration riêng biệt:
-	// - genDuration: cho Issued TPS (measurement window)
-	// - workerDuration: cho Completed/Success/Error TPS (tránh inflate)
-	return MergeWorkerResults(results, genDuration, workerDuration, r.cfg.Load.TargetTPS, issued, rc.Dropped())
+	// Đợi RateControllers xong (sau benchmark duration)
+	rcWg.Wait()
+	genDuration := time.Since(start)
+
+	// Đợi Workers drain hết queue hoặc hết grace period
+	workerWg.Wait()
+	workerDuration := time.Since(start)
+
+	issued := rcs.Issued()
+	dropped := rcs.Dropped()
+
+	return MergeWorkerResults(results, genDuration, workerDuration, r.cfg.Load.TargetTPS, issued, dropped)
 }
 
 // printConfig in tóm tắt cấu hình benchmark ra stdout.
@@ -279,7 +343,12 @@ func (r *Runner) printConfig() {
 	fmt.Printf("  Database:       %s\n", r.cfg.Database.Type)
 	fmt.Printf("  Target TPS:     %d\n", r.cfg.Load.TargetTPS)
 	fmt.Printf("  Concurrency:    %d\n", r.cfg.Load.MaxConcurrency)
-	fmt.Printf("  Queue Size:     %d\n", r.cfg.Load.QueueSize)
+	fmt.Printf("  Queue Size:     %d total (%d per worker)\n", r.cfg.Load.QueueSize, r.cfg.Load.QueueSize/r.cfg.Load.MaxConcurrency)
+	if r.cfg.Load.GOMAXPROCS > 0 {
+		fmt.Printf("  GOMAXPROCS:     %d\n", r.cfg.Load.GOMAXPROCS)
+	} else {
+		fmt.Printf("  GOMAXPROCS:     %d (system default)\n", runtime.GOMAXPROCS(0))
+	}
 	fmt.Printf("  Key Count:      %d\n", r.cfg.Data.KeyCount)
 	fmt.Printf("  Payload Size:   %d bytes\n", r.cfg.Data.PayloadSize)
 	fmt.Printf("  Seed:           %d\n", r.cfg.Data.Seed)
@@ -311,24 +380,59 @@ func (r *Runner) printConfig() {
 // Phát request với TPS mục tiêu, báo cáo real-time sau mỗi giây.
 // Tự động dừng khi nhận ctx.Done() (thường là do Ctrl+C).
 func (r *Runner) runOpenLoop(ctx context.Context) {
-	requests := make(chan Request, r.cfg.Load.QueueSize)
+	concurrency := r.cfg.Load.MaxConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
 
-	gen := NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed, r.keys)
-	rc := NewRateController(r.cfg.Load.TargetTPS)
-	wp := NewWorkerPool(r.db, r.cfg.Load.MaxConcurrency)
+	queueSizePerWorker := r.cfg.Load.QueueSize / concurrency
+	if queueSizePerWorker < 2 {
+		queueSizePerWorker = 2
+	}
 
-	// Chạy rate controller trong goroutine riêng
-	rcDone := make(chan struct{})
-	go func() {
-		rc.Run(ctx, gen, requests)
-		close(requests)
-		close(rcDone)
-	}()
+	rcs := NewRateControllerGroup(r.cfg.Load.TargetTPS, concurrency)
+	reqChans := make([]chan Request, concurrency)
+	gens := make([]*WorkloadGenerator, concurrency)
+	results := make([]*WorkerResult, concurrency)
 
-	// Chạy worker pool với trackLatency = true, cumulative = false
-	// để tính P50/P95/P99 latency real-time theo từng giây (sliding window)
-	// mà không bị phình bộ nhớ và không bị data race
-	results, wait := wp.Start(ctx, requests, true, false)
+	for i := 0; i < concurrency; i++ {
+		reqChans[i] = make(chan Request, queueSizePerWorker)
+		gens[i] = NewWorkloadGenerator(r.cfg, r.cfg.Data.Seed+int64(i)*10007, r.keys)
+		results[i] = &WorkerResult{
+			windowLatencies: make([]time.Duration, 0, 2048),
+		}
+	}
+
+	// Chạy các rate controller phân tán
+	var rcWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		rcWg.Add(1)
+		go func(idx int) {
+			defer rcWg.Done()
+			rcs[idx].Run(ctx, gens[idx], reqChans[idx])
+			close(reqChans[idx])
+		}(i)
+	}
+
+	// Chạy các worker tương ứng với từng channel riêng biệt (zero lock contention)
+	var workerWg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWg.Add(1)
+		go func(idx int) {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case req, ok := <-reqChans[idx]:
+					if !ok {
+						return
+					}
+					executeRequest(r.db, req, results[idx], true, false)
+				}
+			}
+		}(i)
+	}
 
 	// Bắt đầu Reporter loop
 	ticker := time.NewTicker(1 * time.Second)
@@ -338,10 +442,10 @@ func (r *Runner) runOpenLoop(ctx context.Context) {
 	startTime := time.Now()
 	lastTick := startTime
 
-	fmt.Println("\n--- Open-Loop Mode ---")
+	fmt.Println("\n--- Open-Loop Mode (Partitioned Workers) ---")
 	fmt.Printf("Target TPS:     %d\n", r.cfg.Load.TargetTPS)
-	fmt.Printf("Concurrency:    %d workers\n", r.cfg.Load.MaxConcurrency)
-	fmt.Printf("Queue Size:     %d\n\n", r.cfg.Load.QueueSize)
+	fmt.Printf("Concurrency:    %d workers (zero centralized channel contention)\n", r.cfg.Load.MaxConcurrency)
+	fmt.Printf("Queue Size:     %d total (%d per worker)\n\n", r.cfg.Load.QueueSize, queueSizePerWorker)
 
 reporterLoop:
 	for {
@@ -362,9 +466,9 @@ reporterLoop:
 				currentLatencies = append(currentLatencies, res.SwapWindowLatencies()...)
 			}
 
-			currentScheduled := rc.Scheduled()
-			currentDropped := rc.Dropped()
-			currentIssued := rc.Issued()
+			currentScheduled := rcs.Scheduled()
+			currentDropped := rcs.Dropped()
+			currentIssued := rcs.Issued()
 			currentCompleted := currentSuccess + currentNotFound + currentErrors
 			inFlight := currentIssued - currentCompleted
 			if inFlight < 0 {
@@ -416,8 +520,8 @@ reporterLoop:
 	}
 
 	fmt.Println("\nWaiting for in-flight requests to finish (grace period)...")
-	<-rcDone
-	wait()
+	rcWg.Wait()
+	workerWg.Wait()
 	fmt.Println("Open-loop benchmark stopped.")
 
 	// In bảng tổng kết toàn bộ phiên chạy open-loop
@@ -430,9 +534,9 @@ reporterLoop:
 			finalErrors += atomic.LoadInt64(&res.Ops[i].Errors)
 		}
 	}
-	finalScheduled := rc.Scheduled()
-	finalIssued := rc.Issued()
-	finalDropped := rc.Dropped()
+	finalScheduled := rcs.Scheduled()
+	finalIssued := rcs.Issued()
+	finalDropped := rcs.Dropped()
 	finalCompleted := finalSuccess + finalNotFound + finalErrors
 
 	fmt.Println("\n============================================")

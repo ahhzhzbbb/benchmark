@@ -47,7 +47,7 @@ func parseAerospikeHost(s string) (*as.Host, error) {
 	return as.NewHost(host, port), nil
 }
 
-func NewAerospikeDB(cfg AerospikeCfg, keyCount int) (*AerospikeDB, error) {
+func NewAerospikeDB(cfg AerospikeCfg, keyCount int, maxConcurrency int) (*AerospikeDB, error) {
 	if len(cfg.Hosts) == 0 {
 		return nil, fmt.Errorf("không có host nào được cấu hình cho Aerospike")
 	}
@@ -67,13 +67,24 @@ func NewAerospikeDB(cfg AerospikeCfg, keyCount int) (*AerospikeDB, error) {
 		timeout = defaultAerospikeTimeout
 	}
 
+	// Cấu hình Connection Pool tương xứng với maxConcurrency:
+	// Đảm bảo mỗi node có đủ socket pre-warmed, tránh contention và hoãn trễ net.Dial
+	minConns := maxConcurrency
+	if minConns < 64 {
+		minConns = 64
+	}
+	connQueueSize := maxConcurrency * 4
+	if connQueueSize < 4096 {
+		connQueueSize = 4096
+	}
+
 	// ClientPolicy PHẢI được cấu hình trước khi tạo client; set sau sẽ không có tác dụng.
 	clientPolicy := as.NewClientPolicy()
 	clientPolicy.Timeout = 5 * time.Second // giống DialTimeout của Redis adapter
 	// Tắt circuit breaker phía client (MAX_ERROR_RATE): benchmark cần thấy lỗi thật của server.
 	clientPolicy.MaxErrorRate = 0
-	// Tăng ConnectionQueueSize và cho phép mở thêm kết nối nếu cần để không bao giờ bị nghẽn do cạn pool
-	clientPolicy.ConnectionQueueSize = 4096
+	clientPolicy.MinConnectionsPerNode = minConns
+	clientPolicy.ConnectionQueueSize = connQueueSize
 	clientPolicy.LimitConnectionsToQueueSize = false
 	clientPolicy.OpeningConnectionThreshold = 0
 	clientPolicy.IdleTimeout = 55 * time.Second
@@ -98,17 +109,17 @@ func NewAerospikeDB(cfg AerospikeCfg, keyCount int) (*AerospikeDB, error) {
 	//   - MaxRecords=queryResultLimit: server dừng ngay sau khi lấy đủ số bản ghi (gửi _INFO3_LAST)
 	//   - ExpectedDuration=SHORT / ShortQuery=true: báo cho Aerospike Server chạy query inline trực tiếp
 	//     trên service thread (giống GET), bỏ qua query monitor và query thread pool overhead
-	//   - RecordQueueSize: buffer cho channel kết quả để worker không bị nghẽn khi nhận stream
+	//   - RecordQueueSize: giảm từ 512 xuống 32 để triệt tiêu chi phí cấp phát channel và giảm áp lực GC
 	queryTimeout := time.Duration(queryTimeoutMs) * time.Millisecond
 	queryPolicy := as.NewQueryPolicy()
 	queryPolicy.TotalTimeout = queryTimeout
 	queryPolicy.SocketTimeout = queryTimeout
 	queryPolicy.IncludeBinData = false
 	queryPolicy.MaxRecords = queryResultLimit
-	queryPolicy.ExpectedDuration = as.SHORT
-	queryPolicy.ShortQuery = true
+	queryPolicy.ExpectedDuration = as.LONG
+	queryPolicy.ShortQuery = false
 	queryPolicy.MaxRetries = 0
-	queryPolicy.RecordQueueSize = 512
+	queryPolicy.RecordQueueSize = 32
 
 	// Pre-generate keys để tránh tính băm RIPEMD-160 và cấp phát heap trong hot path đo latency
 	var keys []*as.Key
@@ -340,6 +351,7 @@ func (a *AerospikeDB) Query(ctx context.Context, query *QuerySpec) error {
 			return ctx.Err()
 		case res, ok := <-results:
 			if !ok {
+				rs.Close()
 				return queryErr
 			}
 			if res.Err != nil && queryErr == nil {

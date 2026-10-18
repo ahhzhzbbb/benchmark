@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 )
 
@@ -14,6 +15,12 @@ func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
 		log.Fatalf("Lỗi đọc cấu hình: %v", err)
+	}
+
+	// Cấu hình GOMAXPROCS nếu người dùng chỉ định (giảm contention trên máy nhiều core)
+	if cfg.Load.GOMAXPROCS > 0 {
+		runtime.GOMAXPROCS(cfg.Load.GOMAXPROCS)
+		log.Printf("GOMAXPROCS set to %d (NumCPU: %d)", cfg.Load.GOMAXPROCS, runtime.NumCPU())
 	}
 
 	// Tạo database adapter dựa trên loại database trong config
@@ -41,13 +48,12 @@ func main() {
 }
 
 // createDatabase tạo database adapter phù hợp dựa trên config.
-// Hiện tại chỉ hỗ trợ Redis. Aerospike sẽ được thêm ở Phase 2.
 func createDatabase(cfg Config) (Database, error) {
 	switch cfg.Database.Type {
 	case "redis":
 		return NewRedisDB(cfg.Redis.Addresses, cfg.Load.MaxConcurrency)
 	case "aerospike":
-		return NewAerospikeDB(cfg.Aerospike, cfg.Data.KeyCount)
+		return NewAerospikeDB(cfg.Aerospike, cfg.Data.KeyCount, cfg.Load.MaxConcurrency)
 	default:
 		return nil, fmt.Errorf("database type không hỗ trợ: %s", cfg.Database.Type)
 	}

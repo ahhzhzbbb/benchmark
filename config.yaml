@@ -41,7 +41,8 @@ data:
 load:
   target_tps: 50000       # Số request/giây mục tiêu (chỉ dùng cho mode run)
   max_concurrency: 64     # Số worker song song
-  queue_size: 10       # Kích thước hàng đợi request. 10000 ở 50k TPS ≈ 200ms đệm trước khi bắt đầu drop
+  queue_size: 10000       # Kích thước hàng đợi request tổng. Được phân bổ đều cho từng worker
+  gomaxprocs: 0           # Giới hạn số logical CPU core cho Go scheduler (0 = giữ nguyên NumCPU, khuyến nghị 16-32 trên server >64 cores)
 
 # Tỉ lệ workload (trọng số tương đối)
 # Ví dụ: get=50, set=30, delete=20 → 50% GET, 30% SET, 20% DELETE

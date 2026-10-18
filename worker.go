@@ -56,7 +56,7 @@ func (r *WorkerResult) SwapWindowLatencies() []time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	res := r.windowLatencies
-	r.windowLatencies = make([]time.Duration, 0, 1024)
+	r.windowLatencies = make([]time.Duration, 0, 2048)
 	return res
 }
 
@@ -167,9 +167,12 @@ func executeRequest(db Database, req Request, result *WorkerResult, trackLatency
 	if errCount%100 == 1 {
 		log.Printf("[DB ERROR SAMPLE] %s err=%v", req.Operation, err)
 	}
-	if req.Operation >= OpQueryTag {
-		errLogger.Printf("[ERROR] %s query=%v err=%v", req.Operation, req.Query, err)
-	} else {
-		errLogger.Printf("[ERROR] %s key=%q err=%v", req.Operation, req.Key, err)
+	// Lấy mẫu ghi log để tránh tranh chấp khóa toàn cục log.Logger và nghẽn disk I/O khi lỗi dồn dập
+	if errCount <= 10 || errCount%100 == 1 {
+		if req.Operation >= OpQueryTag {
+			errLogger.Printf("[ERROR #%d] %s query=%v err=%v", errCount, req.Operation, req.Query, err)
+		} else {
+			errLogger.Printf("[ERROR #%d] %s key=%q err=%v", errCount, req.Operation, req.Key, err)
+		}
 	}
 }

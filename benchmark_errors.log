@@ -1,1 +1,4 @@
 2026/10/17 14:26:15 [ERROR] GET key="bench:key:3" err=connection reset
+2026/10/17 22:51:26 [ERROR #1] GET key="bench:key:3" err=connection reset
+2026/10/17 23:01:44 [ERROR #1] GET key="bench:key:3" err=connection reset
+2026/10/17 23:03:29 [ERROR #1] GET key="bench:key:3" err=connection reset

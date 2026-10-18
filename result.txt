@@ -1,0 +1,102 @@
+------------------------BENCHMARK JOB--------------------------------------------
+Mem: 369325740K used, 26078956K free, 4217020K shrd, 1388K buff, 29759588K cached
+CPU:   5% usr   3% sys   3% nic  87% idle   0% io   0% irq   0% sirq
+Load average: 91.89 85.28 80.39 82/4311 86
+  PID  PPID USER     STAT   VSZ %VSZ CPU %CPU COMMAND
+    1     0 root     S    6266m   0%  57   1% ./benchmarkDB --config config.yaml --mode open-loop --tps 10000 --concurrency 1000 --gomaxprocs 64 --set 0 --get 0 --delete 0 --query-tag 100 --query-numeric 0
+   80     0 root     S     1712   0%  57   0% sh
+   86    80 root     R     1640   0%  57   0% top
+```[cite: 32]
+
+
+
+
+
+
+
+----------------------AEROSPIKE PODS-----------------------------------------
+
+top - 14:36:33 up 3 days, 21:41,  0 users,  load average: 42.49, 42.08, 42.24
+Tasks:   4 total,   1 running,   3 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  8.6 us,  3.7 sy,  3.5 ni, 84.1 id,  0.0 wa,  0.1 hi,  0.1 si,  0.0 st
+KiB Mem : 39488044+total,  2674260 free, 34271939+used, 49486788 buff/cache
+KiB Swap:        0 total,        0 free,        0 used. 45099880 avail Mem
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+    7 5gc       20   0 5018096 659968  43316 S  10.0  0.2   3:37.36 asd
+    1 5gc       20   0    4044    720    656 S   0.0  0.0   0:00.01 dumb-init
+  609 5gc       20   0   18220   3396   2824 S   0.0  0.0   0:00.00 bash
+  998 5gc       20   0   41044   3160   2692 R   0.0  0.0   0:00.00 top
+```[cite: 33]
+
+---
+
+**Panel bên phải:**
+```text
+top - 14:36:31 up 11 days, 21:35,  0 users,  load average: 41.16, 38.75, 37.07
+Tasks:   4 total,   1 running,   3 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 16.6 us,  1.9 sy,  5.1 ni, 76.3 id,  0.0 wa,  0.1 hi,  0.1 si,  0.0 st
+KiB Mem : 39488041+total, 12237964 free, 29819075+used, 84451720 buff/cache
+KiB Swap:        0 total,        0 free,        0 used. 93577600 avail Mem
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+    7 5gc       20   0 5009924 774332  43212 S   9.3  0.2   3:28.44 asd
+    1 5gc       20   0    4044    688    624 S   0.0  0.0   0:00.00 dumb-init
+  622 5gc       20   0   18216   3372   2808 S   0.0  0.0   0:00.00 bash
+  927 5gc       20   0   41044   3196   2728 R   0.0  0.0   0:00.00 top
+```[cite: 33]
+
+
+Pods(db-benchmark)[11]
+NAME↑                       PF  READY  STATUS     RESTARTS   CPU    MEM   %CPU/R   %CPU/L   %MEM/R   %MEM/L IP             NODE              AGE
+bmaerospike-runner-7brtw    ●   1/1    Running           0  1683   2588      n/a      n/a      n/a      n/a 172.16.14.130  hl19f-5gc-com93   4m2s
+db-0                        ●   1/1    Running           0    83    661        1        1        3        3 172.16.193.14  hl19f-5gc-com91   41m
+db-1                        ●   1/1    Running           0    97    782        1        1        4        4 172.16.144.8   hl19f-5gc-com90   40m
+```[cite: 34]
+
+
+
+-----------------------------------------------------logs--------------------------------------------------------------
+Logs(db-benchmark/bmaerospike-runner-7brtw:benchmark)[tail]
+Autoscroll:On    FullScreen:Off    Timestamps:Off    Wrap:Off
+
+[00:03:29] Sched:  9518/s | Sent: 1589/s | Ack: 1675/s (Err: 0, 0.00%) | Drop:  7929/s (tot 1842118) | InFlight: 10845 | P50: 619.223187ms | P95: 2.35261484s  | P99: 3.073381519s
+[00:03:30] Sched: 11027/s | Sent: 1096/s | Ack:  976/s (Err: 0, 0.00%) | Drop:  9931/s (tot 1850508) | InFlight: 10946 | P50: 700.932369ms | P95: 1.834992457s | P99: 2.273487403s
+[00:03:31] Sched:  9729/s | Sent: 1002/s | Ack:  975/s (Err: 0, 0.00%) | Drop:  8727/s (tot 1860469) | InFlight: 10977 | P50: 610.47719ms  | P95: 2.184244502s | P99: 2.810896149s
+[00:03:32] Sched: 10032/s | Sent: 1385/s | Ack: 1497/s (Err: 0, 0.00%) | Drop:  8647/s (tot 1867617) | InFlight: 10884 | P50: 624.483457ms | P95: 2.647599675s | P99: 3.302782073s
+[00:03:33] Sched: 10332/s | Sent: 1286/s | Ack: 1456/s (Err: 0, 0.00%) | Drop:  9045/s (tot 1876812) | InFlight: 10711 | P50: 129.394067ms | P95: 2.343550728s | P99: 3.738657838s
+[00:03:34] Sched:  9970/s | Sent:  981/s | Ack:  707/s (Err: 0, 0.00%) | Drop:  8988/s (tot 1885669) | InFlight: 10981 | P50: 446.606446ms | P95: 2.412299276s | P99: 4.023694676s
+[00:03:35] Sched: 10093/s | Sent: 1254/s | Ack: 1318/s (Err: 0, 0.00%) | Drop:  8838/s (tot 1894719) | InFlight: 10916 | P50: 617.965737ms | P95: 3.214396917s | P99: 4.298264163s
+[00:03:36] Sched:  9955/s | Sent: 1326/s | Ack: 1472/s (Err: 0, 0.00%) | Drop:  8628/s (tot 1903362) | InFlight: 10770 | P50: 155.509892ms | P95: 2.769599444s | P99: 4.189992748s
+[00:03:37] Sched:  9288/s | Sent:  470/s | Ack:  344/s (Err: 0, 0.00%) | Drop:  8818/s (tot 1913269) | InFlight: 10911 | P50: 1.17106508s  | P95: 4.110569332s | P99: 4.79491883s
+[00:03:38] Sched: 10702/s | Sent: 1101/s | Ack: 1208/s (Err: 0, 0.00%) | Drop:  9601/s (tot 1921910) | InFlight: 10814 | P50: 443.631917ms | P95: 3.503182731s | P99: 5.095845088s
+[00:03:39] Sched: 10212/s | Sent: 1215/s | Ack: 1082/s (Err: 0, 0.00%) | Drop:  8997/s (tot 1930839) | InFlight: 10946 | P50: 926.382144ms | P95: 4.092509637s | P99: 6.014039176s
+[00:03:40] Sched:  9785/s | Sent: 1045/s | Ack: 1264/s (Err: 0, 0.00%) | Drop:  8739/s (tot 1939070) | InFlight: 10740 | P50: 248.808354ms | P95: 3.278816517s | P99: 5.77984668s
+[00:03:41] Sched:  9949/s | Sent: 1275/s | Ack: 1162/s (Err: 0, 0.00%) | Drop:  8675/s (tot 1948169) | InFlight: 10859 | P50: 483.294254ms | P95: 2.972934483s | P99: 5.282712625s
+[00:03:42] Sched:  8326/s | Sent:  897/s | Ack:  966/s (Err: 0, 0.00%) | Drop:  7427/s (tot 1956996) | InFlight: 10777 | P50: 531.428901ms | P95: 3.066917809s | P99: 4.523795778s
+[00:03:43] Sched: 12811/s | Sent: 1793/s | Ack: 1593/s (Err: 0, 0.00%) | Drop: 11017/s (tot 1965627) | InFlight: 10934 | P50: 455.716761ms | P95: 2.89402134s  | P99: 4.47587539s
+[00:03:44] Sched:  6882/s | Sent:  584/s | Ack:  720/s (Err: 0, 0.00%) | Drop:  6298/s (tot 1972506) | InFlight: 10785 | P50: 644.618065ms | P95: 3.097477196s | P99: 5.10346575s
+[00:03:45] Sched: 11422/s | Sent:  899/s | Ack:  767/s (Err: 0, 0.00%) | Drop: 10523/s (tot 1985463) | InFlight: 10947 | P50: 279.145209ms | P95: 2.877653422s | P99: 4.696535244s
+[00:03:46] Sched: 12081/s | Sent:  841/s | Ack:  918/s (Err: 0, 0.00%) | Drop: 11239/s (tot 1993834) | InFlight: 10890 | P50: 821.554303ms | P95: 3.187651203s | P99: 4.54561657s
+[00:03:47] Sched:  9194/s | Sent: 1036/s | Ack: 1303/s (Err: 0, 0.00%) | Drop:  8157/s (tot 2002669) | InFlight: 10601 | P50: 237.849944ms | P95: 3.649959432s | P99: 4.855024193s
+[00:03:48] Sched: 10088/s | Sent: 1310/s | Ack: 1146/s (Err: 0, 0.00%) | Drop:  8777/s (tot 2014634) | InFlight: 10825 | P50: 912.941654ms | P95: 4.291513573s | P99: 5.566438492s
+[00:03:49] Sched: 11327/s | Sent:  873/s | Ack:  641/s (Err: 0, 0.00%) | Drop: 10454/s (tot 2020943) | InFlight: 10965 | P50: 415.374708ms | P95: 3.838221114s | P99: 6.00578773s
+[00:03:50] Sched:  9570/s | Sent:  777/s | Ack:  765/s (Err: 0, 0.00%) | Drop:  8792/s (tot 2030585) | InFlight: 10979 | P50: 1.228534072s | P95: 3.504303789s | P99: 4.467277529s
+[00:03:51] Sched: 10463/s | Sent: 1177/s | Ack: 1332/s (Err: 0, 0.00%) | Drop:  9285/s (tot 2038137) | InFlight: 10853 | P50: 607.701155ms | P95: 2.602359952s | P99: 4.072650128s
+[00:03:52] Sched: 10176/s | Sent: 1384/s | Ack: 1289/s (Err: 0, 0.00%) | Drop:  8791/s (tot 2047039) | InFlight: 10949 | P50: 511.040069ms | P95: 2.987355123s | P99: 3.736788789s
+[00:03:53] Sched:  9865/s | Sent:  552/s | Ack:  565/s (Err: 0, 0.00%) | Drop:  9312/s (tot 2056567) | InFlight: 10935 | P50: 702.184109ms | P95: 2.774677432s | P99: 4.019549297s
+[00:03:54] Sched:  9830/s | Sent: 1300/s | Ack: 1319/s (Err: 0, 0.00%) | Drop:  8529/s (tot 2064450) | InFlight: 10918 | P50: 772.866373ms | P95: 3.061426141s | P99: 4.418766399s
+[00:03:55] Sched:  9964/s | Sent:  999/s | Ack: 1294/s (Err: 0, 0.00%) | Drop:  8964/s (tot 2074590) | InFlight: 10585 | P50: 46.774532ms  | P95: 2.391418155s | P99: 3.859018393s
+[00:03:56] Sched:  9138/s | Sent: 1545/s | Ack: 1277/s (Err: 0, 0.00%) | Drop:  7593/s (tot 2082085) | InFlight: 10849 | P50: 655.148601ms | P95: 3.379369565s | P99: 4.645586563s
+[00:03:57] Sched:  9173/s | Sent:  754/s | Ack:  899/s (Err: 0, 0.00%) | Drop:  8419/s (tot 2089408) | InFlight: 10723 | P50: 740.222412ms | P95: 3.13500133s  | P99: 4.079883217s
+[00:03:58] Sched: 11539/s | Sent:  768/s | Ack:  758/s (Err: 0, 0.00%) | Drop: 10770/s (tot 2102576) | InFlight: 10736 | P50: 1.364902669s | P95: 2.574581926s | P99: 3.348498272s
+[00:03:59] Sched:  9413/s | Sent: 1162/s | Ack:  908/s (Err: 0, 0.00%) | Drop:  8250/s (tot 2110514) | InFlight: 10980 | P50: 401.833266ms | P95: 4.366759837s | P99: 5.230696014s
+[00:04:00] Sched:  9404/s | Sent:  931/s | Ack: 1028/s (Err: 0, 0.00%) | Drop:  8472/s (tot 2119513) | InFlight: 10877 | P50: 689.476891ms | P95: 2.013670328s | P99: 2.702589282s
+[00:04:01] Sched: 10667/s | Sent: 1150/s | Ack:  993/s (Err: 0, 0.00%) | Drop:  9510/s (tot 2128517) | InFlight: 11025 | P50: 721.339111ms | P95: 2.544163271s | P99: 3.56986272s
+[00:04:02] Sched: 10642/s | Sent: 1209/s | Ack: 1466/s (Err: 0, 0.00%) | Drop:  9440/s (tot 2136411) | InFlight: 10810 | P50: 646.62933ms  | P95: 2.870402059s | P99: 3.686694244s
+[00:04:03] Sched:  8901/s | Sent: 1096/s | Ack: 1130/s (Err: 0, 0.00%) | Drop:  7804/s (tot 2146473) | InFlight: 10767 | P50: 443.737984ms | P95: 2.598742019s | P99: 3.23014015s
+[00:04:04] Sched:  9981/s | Sent: 1225/s | Ack: 1199/s (Err: 0, 0.00%) | Drop:  8755/s (tot 2152858) | InFlight: 10786 | P50: 693.46053ms  | P95: 2.575560276s | P99: 3.613331734s
+[00:04:05] Sched: 11031/s | Sent: 1109/s | Ack:  973/s (Err: 0, 0.00%) | Drop:  9922/s (tot 2166439) | InFlight: 10972 | P50: 642.433087ms | P95: 2.655233778s | P99: 3.839716447s
+[00:04:06] Sched:  9927/s | Sent: 1126/s | Ack: 1294/s (Err: 0, 0.00%) | Drop:  8800/s (tot 2171506) | InFlight: 10874 | P50: 445.991523ms | P95: 2.968155209s | P99: 4.031995622s
+[00:04:07] Sched:  9957/s | Sent: 1318/s | Ack: 1401/s (Err: 0, 0.00%) | Drop:  8638/s (tot 2180207) | InFlight: 10791 | P50: 347.454234ms | P95: 2.8021092s   | P99: 4.157209634s
+
